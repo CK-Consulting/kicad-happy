@@ -25,7 +25,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lifecycle_audit import STATUS_CAPABLE, _normalize_status  # noqa: E402
-from lifecycle_cache import compute  # noqa: E402
+from lifecycle_cache import compute, mpn_key  # noqa: E402
 from lifecycle_table import (  # noqa: E402
     read_table, render_table, user_row, is_departed,
 )
@@ -34,7 +34,7 @@ SEP = "\x1f"
 
 
 def statuses_from_cache(cache_path: str) -> dict[str, dict[str, str]]:
-    """Every cached answer, as {mpn: {source: normalised status}}."""
+    """Every cached answer, as {mpn_key(mpn): {source: normalised status}}."""
     with open(cache_path) as fh:
         blob = json.load(fh)
     out: dict[str, dict[str, str]] = {}
@@ -90,7 +90,8 @@ def main() -> int:
 
     changed = 0
     for mpn, row in rows.items():
-        per_source = cached.get(mpn, {})
+        # Cache keys are normalised; the table keeps the part's own spelling.
+        per_source = cached.get(mpn_key(mpn), {})
         scored = compute(per_source, capable, user_row(row))
         before = (row.get("Computed"), row.get("Ack?"))
         row["Status"] = scored.get("status", "unknown")

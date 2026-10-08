@@ -31,6 +31,7 @@ from typing import Any, Iterable
 
 __all__ = [
     "LifecycleCache",
+    "mpn_key",
     "SourceScheduler",
     "score",
     "STATUS_AXIS",
@@ -118,6 +119,16 @@ def score(per_source_status: dict[str, str],
     }
 
 
+def mpn_key(mpn: str) -> str:
+    """The spelling of an MPN the cache files it under.
+
+    Upper-cased and trimmed, so "nRF52840-QIAA" and "NRF52840-QIAA " are one
+    part. Anything reading cache keys back has to look parts up through this
+    too: the table keeps the part's own spelling, and a direct lookup misses.
+    """
+    return mpn.strip().upper()
+
+
 class LifecycleCache:
     """Distributor answers and per-source timing, persisted between runs.
 
@@ -176,7 +187,7 @@ class LifecycleCache:
 
     @staticmethod
     def _key(mpn: str, source: str) -> str:
-        return "%s\x1f%s" % (mpn.strip().upper(), source)
+        return "%s\x1f%s" % (mpn_key(mpn), source)
 
     def get(self, mpn: str, source: str) -> dict | None:
         row = self._entries.get(self._key(mpn, source))
