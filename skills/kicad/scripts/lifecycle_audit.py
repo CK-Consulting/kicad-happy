@@ -732,6 +732,12 @@ DEFAULT_SOURCES = ["lcsc", "digikey", "element14", "mouser"]
 # distributors were contacted.
 STATUS_CAPABLE = {"digikey", "nexar"}
 
+# Which sources can return an operating-temperature range - every one of them
+# parses it. Kept separate from STATUS_CAPABLE because lifecycle and
+# temperature finish at different times: the confidence exit settles the
+# first, and only a datasheet extraction settles the second.
+TEMPERATURE_CAPABLE = {"digikey", "mouser", "lcsc", "element14", "nexar"}
+
 
 def parse_sources(text: str) -> list[str]:
     """A comma-separated source list from the command line, checked.
@@ -857,9 +863,15 @@ def audit_component(mpn: str, sources: list[str], project_dir: str | None = None
     if remaining and _score is not None:
         early = _score(per_source_status)
         if early["confidence"] >= confidence_exit:
-            # Enough agreement already; the rest of the sources would only
-            # confirm it, and confirmation is the expensive part.
-            remaining = []
+            # Enough agreement on lifecycle already; the rest of the sources
+            # would only confirm it, and confirmation is the expensive part.
+            # But that settles lifecycle, not temperature: the ranges are
+            # intersected, so any source still unasked may carry the only
+            # range or a narrower one, and skipping it made LT-001 depend on
+            # cache coverage. Only a datasheet extraction, which outranks
+            # every distributor's range, lets those sources go too.
+            remaining = [s for s in remaining
+                         if s in TEMPERATURE_CAPABLE and temp_data is None]
 
     if remaining:
         order = scheduler.order() if scheduler is not None else remaining
@@ -1598,7 +1610,10 @@ def main():
     )
     parser.add_argument(
         "--confidence-exit", type=float, default=0.90,
-        help="Stop querying a part once confidence reaches this (default: 0.90)",
+        help="Stop asking for a part's lifecycle once confidence reaches this "
+             "(default: 0.90). Sources that can still supply an operating-"
+             "temperature range are asked regardless, unless a datasheet "
+             "extraction already gives one",
     )
     parser.add_argument(
         "--report-threshold", type=float, default=0.80,

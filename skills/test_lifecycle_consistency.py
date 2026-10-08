@@ -35,9 +35,10 @@ OTHER = "STM32U5G9NJH6Q"
 
 
 @contextmanager
-def _distributors(digikey, fail_if_called=False):
+def _distributors(digikey, fail_if_called=False, lcsc_range=None):
     """DigiKey answers ``digikey`` (None: carries the part, gives no status);
-    every other source carries it with no status, as most of them do."""
+    every other source carries it with no status, as most of them do. LCSC
+    can also be given an operating-temperature range to report."""
     saved = dict(lifecycle_audit._API_FNS)
 
     def answer(name):
@@ -46,6 +47,9 @@ def _distributors(digikey, fail_if_called=False):
                 raise AssertionError("%s queried on a fully cached run" % name)
             if name == "digikey" and digikey:
                 return {"status": digikey}
+            if name == "lcsc" and lcsc_range:
+                return {"provides_status": False, "temp_min_c": lcsc_range[0],
+                        "temp_max_c": lcsc_range[1]}
             return {"provides_status": False}
         return query
     for src in saved:
@@ -57,11 +61,11 @@ def _distributors(digikey, fail_if_called=False):
         lifecycle_audit._API_FNS.update(saved)
 
 
-def _audit(proj, mpns, digikey="Active", cached=False):
+def _audit(proj, mpns, digikey="Active", cached=False, lcsc_range=None, **kw):
     bom = {"bom": [{"mpn": m, "references": ["U%d" % i]}
                    for i, m in enumerate(mpns, start=1)]}
-    with _distributors(digikey, fail_if_called=cached):
-        return lifecycle_audit.audit_bom(bom, project_dir=proj)
+    with _distributors(digikey, fail_if_called=cached, lcsc_range=lcsc_range):
+        return lifecycle_audit.audit_bom(bom, project_dir=proj, **kw)
 
 
 def _edit(proj, mpn, **cells):
@@ -233,6 +237,30 @@ def test_human_override_on_a_cached_run():
                                    "Checked On": TODAY})
     r = _audit(proj, ["TPS62840DLCR"], cached=True)
     _assert_agree(proj, r, "TPS62840DLCR", {"status": "nrnd", "ack": True})
+
+
+def _temperature_findings(result, mpn):
+    return [(f["rule_id"], f["component_range"]) for f in result["findings"]
+            if f.get("category") == "temperature" and f.get("mpn") == mpn]
+
+
+def test_a_confident_cached_status_does_not_cut_off_temperature_evidence():
+    """Reaching the confidence exit on a cached lifecycle answer skipped every
+    remaining source, including the one carrying the only temperature range,
+    so LT-001 appeared on a fetched run and vanished on a partly cached one."""
+    mpn = "TPS62840DLCR"
+    kw = {"temp_range": (-40.0, 85.0), "confidence_exit": 0.5,
+          "sources": ["digikey", "lcsc"]}
+    fetched = _audit(tempfile.mkdtemp(), [mpn], lcsc_range=(-20.0, 70.0), **kw)
+
+    proj = tempfile.mkdtemp()
+    _audit(proj, [mpn], sources=["digikey"])         # DigiKey's answer cached
+    partly_cached = _audit(proj, [mpn], lcsc_range=(-20.0, 70.0), **kw)
+
+    expected = [("LT-001", {"min_c": -20.0, "max_c": 70.0})]
+    assert _temperature_findings(fetched, mpn) == expected
+    assert _temperature_findings(partly_cached, mpn) == expected
+    _assert_agree(proj, partly_cached, mpn, {"status": "active"})
 
 if __name__ == "__main__":
     failures = 0
