@@ -1584,14 +1584,15 @@ def main():
                       f"Presets: {', '.join(_TEMP_PRESETS.keys())}", file=sys.stderr)
                 sys.exit(1)
 
-    # Parse sources
-    sources = args.only.split(",") if args.only else []
+    # Parse sources. --nexar adds Nexar to whatever set is in force, the
+    # explicit one included: letting a non-empty --only win silently dropped it.
+    sources = list(args.only.split(",") if args.only else DEFAULT_SOURCES)
+    if getattr(args, "nexar", False) and "nexar" not in sources:
+        sources.append("nexar")
 
     # Run audit
     result = audit_bom(analysis, project_dir=project_dir, temp_range=temp_range,
-                       sources=(sources or (DEFAULT_SOURCES + ["nexar"]
-                                            if getattr(args, "nexar", False)
-                                            else DEFAULT_SOURCES)),
+                       sources=sources,
                        delay=args.delay,
                        cache_path=args.cache_path,
                        ttl_days=args.ttl_days,

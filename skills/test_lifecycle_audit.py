@@ -229,7 +229,7 @@ def test_a_human_check_still_counts_after_the_bom_respells_the_mpn():
 
 # -- --no-cache -----------------------------------------------------------
 
-def _run_cli(*argv):
+def _run_cli(*argv, only=("--only", "digikey"), fns=None):
     """The audit's CLI against a one-part BOM in a fresh project directory."""
     proj = tempfile.mkdtemp()
     analysis = os.path.join(proj, "schematic.json")
@@ -238,10 +238,9 @@ def _run_cli(*argv):
                    "bom": [{"mpn": "TPS62840DLCR", "references": ["U1"]}]}, fh)
     out = os.path.join(proj, "lifecycle.json")
     saved = sys.argv
-    sys.argv = ["lifecycle_audit.py", analysis, "--only", "digikey",
-                "-o", out, *argv]
+    sys.argv = ["lifecycle_audit.py", analysis, *only, "-o", out, *argv]
     try:
-        with _sources(digikey=_answers("Active")):
+        with _sources(**(fns or {"digikey": _answers("Active")})):
             lifecycle_audit.main()
     finally:
         sys.argv = saved
@@ -276,6 +275,36 @@ def test_no_cache_reads_no_cache():
     assert result["lifecycle_summary"]["active"] == 1
     with open(path) as fh:
         assert fh.read() == before
+
+
+# -- source selection -----------------------------------------------------
+
+def _asked(*argv):
+    """Which sources the CLI actually queried, and how often, for these flags."""
+    calls: list[str] = []
+
+    def spy(name):
+        def query(mpn, timeout=10.0):
+            calls.append(name)
+            return {"provides_status": False}
+        return query
+    _run_cli(*argv, only=(), fns={s: spy(s) for s in lifecycle_audit._API_FNS})
+    return sorted(calls)
+
+
+def test_nexar_is_added_to_an_explicit_source_list():
+    """--nexar says "also query Nexar". With --only it was silently dropped,
+    because the explicit list won and the flag was never consulted."""
+    assert _asked("--only", "digikey", "--nexar", "--no-cache") == ["digikey", "nexar"]
+
+
+def test_nexar_named_twice_is_asked_once():
+    assert _asked("--only", "digikey,nexar", "--nexar", "--no-cache") == ["digikey", "nexar"]
+
+
+def test_nexar_flag_alone_extends_the_defaults():
+    assert _asked("--nexar", "--no-cache") == sorted(
+        lifecycle_audit.DEFAULT_SOURCES + ["nexar"])
 
 
 # -- alternatives ---------------------------------------------------------
