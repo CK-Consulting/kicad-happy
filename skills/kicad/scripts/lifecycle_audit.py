@@ -167,6 +167,21 @@ def _is_real_mpn(mpn: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# A source that could not answer
+# ---------------------------------------------------------------------------
+
+class SourceUnavailable(Exception):
+    """A source could not be asked: no credentials, a timeout, an HTTP error.
+
+    Distinct from a query returning None, which means the source answered and
+    does not carry the part. The two used to look the same, so a missing key
+    or a slow afternoon was cached for the whole TTL as "not carried", and
+    adding the key afterwards changed nothing until the cache expired. Only an
+    answer is worth remembering; this is the absence of one.
+    """
+
+
+# ---------------------------------------------------------------------------
 # DigiKey API (OAuth 2.0)
 # ---------------------------------------------------------------------------
 
@@ -211,7 +226,7 @@ def query_lifecycle_digikey(mpn: str, timeout: float = 10.0) -> dict | None:
     """Query DigiKey for lifecycle and temperature data."""
     auth = _get_digikey_token()
     if not auth:
-        return None
+        raise SourceUnavailable("digikey: no credentials, or no token issued")
     token, client_id = auth
 
     try:
@@ -227,8 +242,8 @@ def query_lifecycle_digikey(mpn: str, timeout: float = 10.0) -> dict | None:
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
-    except (urllib.error.URLError, OSError, json.JSONDecodeError):
-        return None
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        raise SourceUnavailable("digikey: %s" % exc) from exc
 
     for product in data.get("Products", []):
         prod_mpn = product.get("ManufacturerProductNumber", "")
@@ -269,7 +284,7 @@ def query_lifecycle_mouser(mpn: str, timeout: float = 10.0) -> dict | None:
     """Query Mouser for lifecycle and temperature data."""
     api_key = os.environ.get("MOUSER_SEARCH_API_KEY") or os.environ.get("MOUSER_PART_API_KEY")
     if not api_key:
-        return None
+        raise SourceUnavailable("mouser: no API key")
 
     try:
         body = json.dumps({
@@ -282,8 +297,8 @@ def query_lifecycle_mouser(mpn: str, timeout: float = 10.0) -> dict | None:
         req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
-    except (urllib.error.URLError, OSError, json.JSONDecodeError):
-        return None
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        raise SourceUnavailable("mouser: %s" % exc) from exc
 
     for part in data.get("SearchResults", {}).get("Parts", []):
         result = {}
@@ -328,8 +343,8 @@ def query_lifecycle_lcsc(mpn: str, timeout: float = 10.0) -> dict | None:
         req = urllib.request.Request(url, headers={"User-Agent": "kicad-happy-lifecycle/1.0"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
-    except (urllib.error.URLError, OSError, json.JSONDecodeError):
-        return None
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        raise SourceUnavailable("lcsc: %s" % exc) from exc
 
     # The upstream response used to nest a part under "extra" with its own
     # mpn and attributes. It now returns the fields flat — description, mfr,
@@ -396,7 +411,7 @@ def query_lifecycle_element14(mpn: str, timeout: float = 10.0,
     """
     api_key = os.environ.get("ELEMENT14_API_KEY")
     if not api_key:
-        return None
+        raise SourceUnavailable("element14: no API key")
 
     store = store or os.environ.get("ELEMENT14_STORE") or "www.newark.com"
     # Built by hand rather than with urlencode: the documented samples put
@@ -418,8 +433,8 @@ def query_lifecycle_element14(mpn: str, timeout: float = 10.0,
                                      headers={"Accept": "application/json"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
-    except (urllib.error.URLError, OSError, json.JSONDecodeError):
-        return None
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        raise SourceUnavailable("element14: %s" % exc) from exc
 
     products = (data.get("manufacturerPartNumberSearchReturn", {})
                     .get("products") or [])
@@ -526,7 +541,7 @@ def query_lifecycle_nexar(mpn: str, timeout: float = 10.0) -> dict | None:
     """
     token = _get_nexar_token()
     if not token:
-        return None
+        raise SourceUnavailable("nexar: no credentials, or no token issued")
     try:
         req = urllib.request.Request(
             "https://api.nexar.com/graphql",
@@ -535,10 +550,10 @@ def query_lifecycle_nexar(mpn: str, timeout: float = 10.0) -> dict | None:
                      "Authorization": "Bearer " + token})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
-    except (urllib.error.URLError, OSError, json.JSONDecodeError):
-        return None
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        raise SourceUnavailable("nexar: %s" % exc) from exc
     if data.get("errors"):
-        return None
+        raise SourceUnavailable("nexar: %s" % data["errors"])
 
     results = (((data.get("data") or {}).get("supSearchMpn") or {})
                .get("results") or [])
@@ -726,20 +741,32 @@ def _timed_query(fn, mpn: str, timeout: float, source: str = "",
     A third outcome is neither: the source refusing us because we asked too
     fast. That must not be recorded as slowness, because the cure is waiting
     longer between calls rather than waiting longer for an answer.
+
+    The fourth value says whether the source actually answered, which is what
+    decides whether the result may be cached. Only an answer can be: a None
+    from a source that was never reached is not "this part is not carried".
     """
     if limiter is not None and source:
         limiter.acquire(source)
     started = time.time()
     try:
         data = fn(mpn, timeout=timeout)
-        return data, time.time() - started, True
+        return data, time.time() - started, True, True
     except Exception as exc:
-        if limiter is not None and source and limiter.is_rejection(exc):
+        # The query functions wrap the transport error; the rate limiter has
+        # to see the HTTP status underneath it.
+        cause = exc.__cause__ if isinstance(exc, SourceUnavailable) else exc
+        if (limiter is not None and source and cause is not None
+                and limiter.is_rejection(cause)):
             limiter.penalise(source)
-            return None, time.time() - started, True
+            return None, time.time() - started, True, False
+        if isinstance(exc, SourceUnavailable):
+            # A transport failure counts against the source's timing; a
+            # missing key does not, since nothing was waited for.
+            return None, time.time() - started, cause is None, False
         if isinstance(exc, (urllib.error.URLError, OSError, json.JSONDecodeError,
                             KeyError, ValueError, TypeError)):
-            return None, time.time() - started, False
+            return None, time.time() - started, False, False
         raise
 
 
@@ -817,12 +844,12 @@ def audit_component(mpn: str, sources: list[str], project_dir: str | None = None
             for fut in _as_completed(futures):
                 source_name = futures[fut]
                 try:
-                    data, elapsed, ok = fut.result()
+                    data, elapsed, ok, answered = fut.result()
                 except Exception:
-                    data, elapsed, ok = None, budgets[source_name], False
+                    data, elapsed, ok, answered = None, budgets[source_name], False, False
                 if cache is not None:
                     cache.observe(source_name, elapsed, ok)
-                    if ok:
+                    if answered:
                         cache.put(mpn, source_name, data)
                 absorb(source_name, data)
 
