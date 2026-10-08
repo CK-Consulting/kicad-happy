@@ -80,8 +80,16 @@ def parse_date(text: str | None) -> float | None:
         return None
 
 
+# A pipe that ends a cell, as opposed to one a person escaped as ``\|`` to put
+# a pipe inside it, which is how Markdown spells that.
+_CELL_PIPE = re.compile(r"(?<!\\)\|")
+
+
 def _split_row(line: str) -> list[str]:
-    cells = line.split("|")
+    # Splitting on every pipe broke an escaped one into an extra cell, shifted
+    # the columns after it, and dict(zip(...)) quietly dropped the overflow.
+    # The escape is kept in the text, so writing the cell back reproduces it.
+    cells = _CELL_PIPE.split(line)
     if cells and not cells[0].strip():
         cells = cells[1:]
     if cells and not cells[-1].strip():
@@ -170,10 +178,12 @@ def cell(value) -> str:
     A pipe or a newline in a Notes field silently splits the row in two, and
     the damage only shows up later as a parse error somewhere else. The
     characters are worth less than the table, so they are replaced rather
-    than escaped: a reader seeing a slash knows what happened.
+    than escaped: a reader seeing a slash knows what happened. A pipe someone
+    already escaped as ``\\|`` is left alone, since it cannot split anything.
     """
     text = "" if value is None else str(value)
-    return text.replace("|", "/").replace("\r", " ").replace("\n", " ").strip()
+    text = _CELL_PIPE.sub("/", text)
+    return text.replace("\r", " ").replace("\n", " ").strip()
 
 
 def render_table(rows: list[dict[str, str]], title: str = "Lifecycle") -> str:

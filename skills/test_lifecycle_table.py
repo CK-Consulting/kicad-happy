@@ -254,3 +254,29 @@ def test_a_pipe_or_newline_in_a_note_cannot_split_the_row():
     assert len(body) == 1
     assert body[0].count("|") == len(COLUMNS) + 1
     assert read_table_text(text)["X1"]["Notes"] == "line one line two / and a pipe"
+
+
+def test_an_escaped_pipe_in_a_user_cell_stays_in_its_cell():
+    """``\\|`` is how Markdown puts a pipe in a cell, and a person editing the
+    table will reach for it. Splitting on it shifted every column after it and
+    dict(zip(...)) dropped the overflow, so the next audit lost their data."""
+    p = _tbl()
+    write_table(p, FINDINGS)
+    rows = read_table(p)
+    row = rows["MM8108-MF15457"]
+    row["Reference"] = r"https://a.example/x \| https://b.example/y"
+    row["Acknowledged"] = "SC 2026-10-08"
+    row["Notes"] = r"vendor A \| vendor B"
+    with open(p, "w", encoding="utf-8") as fh:
+        fh.write(render_table(list(rows.values())))
+
+    got = read_table(p)["MM8108-MF15457"]
+    assert got["Reference"] == r"https://a.example/x \| https://b.example/y"
+    assert got["Acknowledged"] == "SC 2026-10-08"
+    assert got["Notes"] == r"vendor A \| vendor B"
+
+    write_table(p, FINDINGS)          # and it survives the script's rewrite
+    again = read_table(p)["MM8108-MF15457"]
+    assert again["Reference"] == r"https://a.example/x \| https://b.example/y"
+    assert again["Notes"] == r"vendor A \| vendor B"
+    assert again["Acknowledged"] == "SC 2026-10-08"
