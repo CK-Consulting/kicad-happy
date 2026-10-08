@@ -40,6 +40,11 @@ DEPARTED_TAG = "no longer in the BOM"
 def is_departed(row: dict[str, str]) -> bool:
     return DEPARTED_TAG in (row.get("Notes") or "")
 
+
+def _without_departed_tag(note: str) -> str:
+    """A note with the departed marker removed and the person's text kept."""
+    return re.sub(r"\s*\(%s\)" % re.escape(DEPARTED_TAG), "", note or "").strip()
+
 # Rewritten from the audit on every run. "Ack?" sits directly beside the score
 # it follows from, because a two-digit number in a monospace edit view does not
 # announce itself — 57 and 85 look alike at a glance, and the difference
@@ -156,6 +161,9 @@ def merge_rows(existing: dict[str, dict[str, str]],
         # Matched case-insensitively; the row takes the BOM's current spelling.
         prior = prior_by_key.get(mpn_key(mpn), {})
         row = {c: prior.get(c, "") for c in USER_COLUMNS}
+        # A part that left and came back is on the board again. Leaving the
+        # marker in place kept is_departed() suppressing its Ack? flag.
+        row["Notes"] = _without_departed_tag(row["Notes"])
         row["MPN"] = mpn
         row["Refs"] = ", ".join(f.get("refs") or [])
         row["Status"] = f.get("status", "unknown")

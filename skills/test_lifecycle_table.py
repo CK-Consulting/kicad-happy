@@ -303,3 +303,23 @@ def test_a_change_of_capitalisation_keeps_the_row_and_its_human_columns():
     assert row["Acknowledged"] == "SC 2026-10-08"
     assert not is_departed(row)
     assert row["Ack?"] == ""
+
+
+def test_a_part_that_returns_to_the_bom_is_no_longer_marked_departed():
+    """The marker stayed in Notes when the part came back, so is_departed()
+    kept suppressing its Ack? flag and it fell off the work list. Only the
+    marker goes; the person's note stays."""
+    p = _tbl()
+    write_table(p, FINDINGS)
+    rows = read_table(p)
+    rows["MM8108-MF15457"]["Notes"] = "vendor confirmed by email"
+    with open(p, "w", encoding="utf-8") as fh:
+        fh.write(render_table(list(rows.values())))
+
+    write_table(p, {"STM32U5G9NJH6Q": FINDINGS["STM32U5G9NJH6Q"]})   # it leaves
+    assert is_departed(read_table(p)["MM8108-MF15457"])
+    write_table(p, FINDINGS)                                        # and returns
+    back = read_table(p)["MM8108-MF15457"]
+    assert not is_departed(back)
+    assert back["Notes"] == "vendor confirmed by email"
+    assert back["Ack?"] == "YES"
