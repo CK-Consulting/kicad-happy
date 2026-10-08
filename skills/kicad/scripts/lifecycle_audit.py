@@ -733,6 +733,22 @@ DEFAULT_SOURCES = ["lcsc", "digikey", "element14", "mouser"]
 STATUS_CAPABLE = {"digikey", "nexar"}
 
 
+def parse_sources(text: str) -> list[str]:
+    """A comma-separated source list from the command line, checked.
+
+    Names are trimmed, and one that is not a known source is an error: a
+    stray space or a typo used to match nothing and be dropped in silence,
+    leaving a run with fewer sources than asked for - or none.
+    """
+    names = [s.strip().lower() for s in text.split(",") if s.strip()]
+    unknown = [s for s in names if s not in _API_FNS]
+    if unknown:
+        raise ValueError("unknown source%s %s (known: %s)"
+                         % ("" if len(unknown) == 1 else "s", ", ".join(unknown),
+                            ", ".join(_API_FNS)))
+    return names
+
+
 def run_sources(sources: list[str] | None = None) -> list[str]:
     """The sources a run asks: the ones named, or the default set."""
     return [s for s in _API_FNS
@@ -1593,7 +1609,10 @@ def main():
 
     # Parse sources. --nexar adds Nexar to whatever set is in force, the
     # explicit one included: letting a non-empty --only win silently dropped it.
-    sources = list(args.only.split(",") if args.only else DEFAULT_SOURCES)
+    try:
+        sources = parse_sources(args.only) if args.only else list(DEFAULT_SOURCES)
+    except ValueError as exc:
+        parser.error("--only: %s" % exc)
     if getattr(args, "nexar", False) and "nexar" not in sources:
         sources.append("nexar")
 

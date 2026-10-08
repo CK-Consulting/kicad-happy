@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lifecycle_audit import (  # noqa: E402
     _default_cache_path, _default_table_path, _normalize_status,
-    run_sources, status_capable_count,
+    parse_sources, run_sources, status_capable_count,
 )
 from lifecycle_cache import (  # noqa: E402
     DEFAULT_TTL_DAYS, LifecycleCache, compute, mpn_key,
@@ -129,8 +129,10 @@ def main() -> int:
     # asked. Counting every status-capable source instead included Nexar,
     # which a default audit never queries, so one active DigiKey answer the
     # audit scored 80 came back from here as 57 and awaiting acknowledgement.
-    sources = ([s.strip() for s in args.sources.split(",") if s.strip()]
-               if args.sources else cache.sources)
+    try:
+        sources = parse_sources(args.sources) if args.sources else cache.sources
+    except ValueError as exc:
+        ap.error("--sources: %s" % exc)
     capable = status_capable_count(sources)
     # Only those sources' answers count, too. The cache is shared across runs,
     # so a Nexar answer from an opt-in run outlives it; the default audit after

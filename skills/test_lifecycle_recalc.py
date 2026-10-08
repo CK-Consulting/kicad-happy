@@ -223,6 +223,17 @@ def test_the_audit_records_its_ttl_with_the_cache():
     with open(os.path.join(proj, "analysis", "lifecycle_cache.json")) as fh:
         assert json.load(fh)["ttl_days"] == 90
 
+
+def test_recalc_rejects_an_unknown_source_name():
+    """--sources with a typo scored every part against zero capable sources."""
+    proj = _project("TPS62840DLCR", ("analysis", "lifecycle_cache.json"))
+    try:
+        _recalc(proj, "--sources", "digikye")
+    except SystemExit as exc:
+        assert exc.code not in (0, None)
+    else:
+        raise AssertionError("an unknown source was accepted")
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

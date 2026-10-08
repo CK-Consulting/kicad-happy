@@ -323,6 +323,23 @@ def test_nexar_flag_alone_extends_the_defaults():
         lifecycle_audit.DEFAULT_SOURCES + ["nexar"])
 
 
+def test_spaces_in_the_source_list_do_not_drop_a_source():
+    """"digikey, mouser" used to ask DigiKey alone: " mouser" matched nothing
+    and was ignored without a word."""
+    assert _asked("--only", "digikey, mouser", "--no-cache") == ["digikey", "mouser"]
+
+
+def test_an_unknown_source_name_is_an_error_not_an_empty_run():
+    """A typo in --only used to run the audit against no sources at all and
+    report every part unknown."""
+    try:
+        _asked("--only", "digikye", "--no-cache")
+    except SystemExit as exc:
+        assert exc.code not in (0, None)
+    else:
+        raise AssertionError("an unknown source was accepted")
+
+
 # -- alternatives ---------------------------------------------------------
 
 def test_alternatives_search_runs_without_credentials():
