@@ -336,6 +336,21 @@ def query_lifecycle_mouser(mpn: str, timeout: float = 10.0) -> dict | None:
 # LCSC (no auth)
 # ---------------------------------------------------------------------------
 
+def _lcsc_identity(comp: dict) -> tuple[str, str]:
+    """A jlcsearch component's part number and manufacturer, in either shape.
+
+    The response used to nest them under "extra"; it now returns fields flat
+    ("mfr" is the manufacturer part number). Both readers go through here, so
+    the lifecycle query and the alternatives search cannot drift apart again —
+    the alternatives search had kept reading only extra.mpn, so against the
+    current API every component's MPN was empty and LCSC never offered one.
+    """
+    extra = comp.get("extra") or {}
+    mpn = extra.get("mpn") or comp.get("mfr") or ""
+    manufacturer = extra.get("manufacturer") or comp.get("manufacturer") or ""
+    return str(mpn), str(manufacturer)
+
+
 def query_lifecycle_lcsc(mpn: str, timeout: float = 10.0) -> dict | None:
     """Query LCSC for availability and temperature data."""
     try:
@@ -358,7 +373,7 @@ def query_lifecycle_lcsc(mpn: str, timeout: float = 10.0) -> dict | None:
         extra = comp.get("extra") or {}
         haystack = " ".join(str(comp.get(k) or "") for k in
                             ("mfr", "description", "lcsc")).upper()
-        comp_mpn = (extra.get("mpn") or comp.get("mfr") or "").upper()
+        comp_mpn = _lcsc_identity(comp)[0].upper()
         if needle not in haystack and not comp_mpn.startswith(needle):
             continue
 
@@ -1047,8 +1062,7 @@ def find_alternatives(mpn: str,
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     data = json.loads(resp.read())
                 for comp in data.get("components", []):
-                    extra = comp.get("extra", {})
-                    comp_mpn = extra.get("mpn", "")
+                    comp_mpn, comp_mfr = _lcsc_identity(comp)
                     if not comp_mpn or comp_mpn.upper() in seen_mpns:
                         continue
                     stock = comp.get("stock", 0)
@@ -1056,7 +1070,7 @@ def find_alternatives(mpn: str,
                         seen_mpns.add(comp_mpn.upper())
                         alternatives.append({
                             "mpn": comp_mpn,
-                            "manufacturer": extra.get("manufacturer", ""),
+                            "manufacturer": comp_mfr,
                             "source": "lcsc",
                             "status": "in_stock",
                             "lcsc_stock": stock,
