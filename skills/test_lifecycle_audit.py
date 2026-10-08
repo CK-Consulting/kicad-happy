@@ -431,6 +431,32 @@ def test_project_and_table_can_be_given_outright():
     assert not os.path.exists(os.path.join(proj, "lifecycle.md"))
 
 
+def _limiter_floor(*argv):
+    """The minimum per-source interval the CLI handed the rate limiter."""
+    seen = []
+    real = lifecycle_audit._RateLimiter
+
+    class Spy(real):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            seen.append(self.min_interval)
+    lifecycle_audit._RateLimiter = Spy
+    try:
+        _run_cli("--no-cache", *argv)
+    finally:
+        lifecycle_audit._RateLimiter = real
+    return seen
+
+
+def test_delay_reaches_the_per_source_limiter():
+    """--delay was parsed and then ignored by every lifecycle query."""
+    assert _limiter_floor("--delay", "2.5") == [2.5]
+
+
+def test_the_default_delay_is_none():
+    assert _limiter_floor() == [0.0]
+
+
 # -- alternatives ---------------------------------------------------------
 
 def test_alternatives_search_runs_without_credentials():

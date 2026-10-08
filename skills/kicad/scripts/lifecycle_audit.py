@@ -817,14 +817,15 @@ def _timed_query(fn, mpn: str, timeout: float, source: str = "",
 
 
 def audit_component(mpn: str, sources: list[str], project_dir: str | None = None,
-                    delay: float = 1.0, cache=None, scheduler=None,
+                    delay: float = 0.0, cache=None, scheduler=None,
                     confidence_exit: float = 0.90, limiter=None) -> dict:
     """Query the available sources for one component's lifecycle + temperature.
 
-    Cache first, then whatever is left, concurrently. ``delay`` is retained for
-    callers that still pass it but is only honoured when running without a
-    scheduler — the sleep it introduced was the audit's dominant cost, and the
-    per-source deadline now does the rate-limiting job it was standing in for.
+    Cache first, then whatever is left, concurrently. Pacing is the
+    ``limiter``'s job: --delay reaches it as a floor under each source's
+    interval, so calls to one source are spaced by at least that many seconds
+    while different sources still run together. ``delay`` itself is accepted
+    for callers that still pass it and is not used here.
     """
     result = {"mpn": mpn, "sources": {}}
     per_source_status: dict[str, str] = {}
@@ -939,16 +940,27 @@ def audit_component(mpn: str, sources: list[str], project_dir: str | None = None
 
 def find_alternatives(mpn: str,
                       sources: list[str] | None = None,
-                      delay: float = 1.0,
-                      timeout: float = 10.0) -> list[dict]:
+                      delay: float = 0.0,
+                      timeout: float = 10.0,
+                      limiter=None) -> list[dict]:
     """Search for active alternative parts when a component is EOL/NRND/obsolete.
 
     Checks Mouser's SuggestedReplacement field first, then searches DigiKey
     and LCSC for parts with similar descriptions. ``timeout`` is the deadline
     for each request, matching the query functions' default.
 
+    Requests are paced by ``limiter`` - the audit's per-source limiter, which
+    carries --delay - so these calls and the lifecycle queries share one
+    spacing per source. Without one, ``delay`` seconds are slept before each.
+
     Returns list of alternatives with mpn, manufacturer, source, status.
     """
+    def pace(source: str) -> None:
+        if limiter is not None:
+            limiter.acquire(source)
+        elif delay > 0:
+            time.sleep(delay)
+
     alternatives = []
     seen_mpns = {mpn.upper()}  # Don't suggest the original part
 
@@ -957,7 +969,7 @@ def find_alternatives(mpn: str,
         api_key = os.environ.get("MOUSER_SEARCH_API_KEY") or os.environ.get("MOUSER_PART_API_KEY")
         if api_key:
             try:
-                time.sleep(delay)
+                pace("mouser")
                 body = json.dumps({
                     "SearchByPartRequest": {
                         "mouserPartNumber": mpn,
@@ -991,7 +1003,7 @@ def find_alternatives(mpn: str,
             base_mpn = re.sub(r'[A-Z]{0,3}$', '', mpn)  # Strip trailing package codes
             if len(base_mpn) >= 4:
                 try:
-                    time.sleep(delay)
+                    pace("digikey")
                     body = json.dumps({"Keywords": base_mpn, "Limit": 5}).encode()
                     req = urllib.request.Request(
                         "https://api.digikey.com/products/v4/search/keyword",
@@ -1029,7 +1041,7 @@ def find_alternatives(mpn: str,
         base_mpn = re.sub(r'[A-Z]{0,3}$', '', mpn)
         if len(base_mpn) >= 4:
             try:
-                time.sleep(delay)
+                pace("lcsc")
                 url = f"https://jlcsearch.tscircuit.com/api/search?q={urllib.parse.quote(base_mpn)}&limit=5&full=true"
                 req = urllib.request.Request(url, headers={"User-Agent": "kicad-happy-lifecycle/1.0"})
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -1064,7 +1076,7 @@ def find_alternatives(mpn: str,
 def audit_bom(analysis_json: dict, project_dir: str | None = None,
               temp_range: tuple[float, float] | None = None,
               sources: list[str] | None = None,
-              delay: float = 1.0,
+              delay: float = 0.0,
               suggest_alternatives: bool = False,
               cache_path: str | None = None,
               ttl_days: float | None = None,
@@ -1082,6 +1094,11 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
     ``report_threshold`` confidence — rather than merely attempted, because a
     part that came back unknown from every source has not been audited in any
     sense a reviewer would accept.
+
+    ``delay`` is the minimum spacing, in seconds, between consecutive requests
+    to the same source (lifecycle queries and alternatives searches alike);
+    different sources are still asked concurrently. Zero, the default, adds
+    no waiting beyond each source's own learned rate limit.
 
     ``use_cache=False`` neither reads nor writes the cache. A zero TTL is not
     the same thing: it only makes old entries stale, and the run still writes
@@ -1129,7 +1146,11 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
         # Recorded so lifecycle_recalc can rescore against the same set.
         cache.sources = asked
         scheduler = _SourceScheduler(cache, asked)
-    limiter = _RateLimiter(cache) if _RateLimiter is not None else None
+    # --delay is a floor under each source's own interval: consecutive calls to
+    # one source are spaced by at least that much, different sources still run
+    # together, and the default of zero adds no waiting.
+    limiter = (_RateLimiter(cache, min_interval=delay)
+               if _RateLimiter is not None else None)
 
     ordered_mpns = sorted(mpn_map.items())
     settled = 0
@@ -1274,7 +1295,7 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
             # Search for alternatives if requested
             if suggest_alternatives:
                 print(f"  Searching for alternatives...", file=sys.stderr)
-                alts = find_alternatives(mpn, sources, delay)
+                alts = find_alternatives(mpn, sources, delay, limiter=limiter)
                 if alts:
                     finding["alternatives"] = alts
 
@@ -1620,8 +1641,11 @@ def main():
         help="Confidence at which a part counts as settled (default: 0.80)",
     )
     parser.add_argument(
-        "--delay", type=float, default=1.0,
-        help="Seconds between API calls (default: 1.0)",
+        "--delay", type=float, default=0.0,
+        help="Minimum seconds between consecutive requests to the same source "
+             "(default: 0, no added waiting). Different sources are still "
+             "queried concurrently; a source's own learned rate limit applies "
+             "when it is longer",
     )
     parser.add_argument(
         "--suggest-alternatives", action="store_true",

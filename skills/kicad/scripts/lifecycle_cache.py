@@ -390,9 +390,16 @@ class RateLimiter:
 
     MAX_INTERVAL = 8.0
 
-    def __init__(self, cache: "LifecycleCache | None" = None) -> None:
+    def __init__(self, cache: "LifecycleCache | None" = None,
+                 min_interval: float = 0.0, clock=None, sleep=None) -> None:
+        """``min_interval`` is a floor under every source's interval - the
+        audit's --delay. Zero, the default, adds no waiting at all. ``clock``
+        and ``sleep`` default to time.monotonic and time.sleep."""
         import threading
         self._lock = threading.Lock()
+        self.min_interval = max(0.0, float(min_interval or 0.0))
+        self._clock = clock or time.monotonic
+        self._sleep = sleep or time.sleep
         self._next_allowed: dict[str, float] = {}
         self._interval: dict[str, float] = dict(self.DEFAULT_INTERVALS)
         self._cache = cache
@@ -403,22 +410,22 @@ class RateLimiter:
                     self._interval[src] = float(learned)
 
     def interval(self, source: str) -> float:
-        return self._interval.get(source, 0.0)
+        return max(self._interval.get(source, 0.0), self.min_interval)
 
     def acquire(self, source: str) -> None:
         """Block until this source may be called again."""
-        gap = self._interval.get(source, 0.0)
+        gap = self.interval(source)
         if gap <= 0:
             return
         while True:
             with self._lock:
-                now = time.monotonic()
+                now = self._clock()
                 ready = self._next_allowed.get(source, 0.0)
                 if now >= ready:
                     self._next_allowed[source] = now + gap
                     return
                 wait = ready - now
-            time.sleep(min(wait, gap))
+            self._sleep(min(wait, gap))
 
     def penalise(self, source: str) -> float:
         """A source said no. Back off, and remember it for the next run."""

@@ -114,6 +114,54 @@ def test_a_known_greedy_source_is_paced():
     assert time.time() - t0 >= r.interval("element14") * 0.9
 
 
+class _FakeClock:
+    """monotonic() and sleep() over a clock that only moves when slept on."""
+
+    def __init__(self):
+        self.now = 1000.0
+        self.slept = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+def test_a_requested_delay_spaces_calls_to_one_source():
+    """--delay N: two requests to the same source at least N seconds apart."""
+    clock = _FakeClock()
+    r = RateLimiter(min_interval=3.0, clock=clock.monotonic, sleep=clock.sleep)
+    r.acquire("digikey")
+    first = clock.now
+    r.acquire("digikey")
+    assert clock.now - first >= 3.0
+
+
+def test_a_requested_delay_does_not_hold_back_other_sources():
+    clock = _FakeClock()
+    r = RateLimiter(min_interval=3.0, clock=clock.monotonic, sleep=clock.sleep)
+    r.acquire("digikey")
+    r.acquire("mouser")
+    assert clock.slept == []
+
+
+def test_no_delay_adds_no_waiting():
+    clock = _FakeClock()
+    r = RateLimiter(clock=clock.monotonic, sleep=clock.sleep)
+    for _ in range(3):
+        r.acquire("digikey")
+        r.acquire("mouser")
+    assert clock.slept == []
+
+
+def test_a_delay_never_shortens_a_learned_interval():
+    clock = _FakeClock()
+    r = RateLimiter(min_interval=0.5, clock=clock.monotonic, sleep=clock.sleep)
+    assert r.interval("element14") == RateLimiter.DEFAULT_INTERVALS["element14"]
+
+
 def test_rejection_backs_off_and_compounds():
     r = RateLimiter()
     first = r.penalise("digikey")
