@@ -280,3 +280,26 @@ def test_an_escaped_pipe_in_a_user_cell_stays_in_its_cell():
     assert again["Reference"] == r"https://a.example/x \| https://b.example/y"
     assert again["Notes"] == r"vendor A \| vendor B"
     assert again["Acknowledged"] == "SC 2026-10-08"
+
+
+def test_a_change_of_capitalisation_keeps_the_row_and_its_human_columns():
+    """The cache treats MPNs case-insensitively; the table did not. A BOM that
+    respelled nRF52840-QIAA got a second, blank row, and the row holding the
+    person's research was marked as having left the board."""
+    p = _tbl()
+    write_table(p, {"NRF52840-QIAA": FINDINGS["MM8108-MF15457"]})
+    rows = read_table(p)
+    rows["NRF52840-QIAA"].update({"User Status": "active",
+                                  "Reference": "https://nordicsemi.com/nrf52840",
+                                  "Acknowledged": "SC 2026-10-08"})
+    with open(p, "w", encoding="utf-8") as fh:
+        fh.write(render_table(list(rows.values())))
+
+    write_table(p, {"nRF52840-QIAA": FINDINGS["MM8108-MF15457"]})
+    after = read_table(p)
+    assert list(after) == ["nRF52840-QIAA"]
+    row = after["nRF52840-QIAA"]
+    assert row["Reference"] == "https://nordicsemi.com/nrf52840"
+    assert row["Acknowledged"] == "SC 2026-10-08"
+    assert not is_departed(row)
+    assert row["Ack?"] == ""

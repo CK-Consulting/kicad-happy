@@ -198,6 +198,35 @@ def test_a_long_nexar_lead_time_raises_lc006():
     assert lc006[0]["severity"] == "warning"
 
 
+# -- the human half of the table ------------------------------------------
+
+def test_a_human_check_still_counts_after_the_bom_respells_the_mpn():
+    """The table row was looked up by exact spelling, so a BOM revision that
+    changed only the capitalisation dropped the person's status from the
+    score."""
+    from lifecycle_table import read_table, render_table, write_table
+    table = os.path.join(tempfile.mkdtemp(), "lifecycle.md")
+    write_table(table, {"NRF52840-QIAA": {"refs": ["U1"], "status": "unknown",
+                                          "computed": 0.0, "raw": 0.0,
+                                          "responding": 0, "capable": 1,
+                                          "needs_ack": True}})
+    rows = read_table(table)
+    rows["NRF52840-QIAA"].update({"User Status": "active",
+                                  "Reference": "https://nordicsemi.com/nrf52840",
+                                  "Checked On": time.strftime("%Y-%m-%d")})
+    with open(table, "w", encoding="utf-8") as fh:
+        fh.write(render_table(list(rows.values())))
+
+    bom = {"bom": [{"mpn": "nRF52840-QIAA", "references": ["U1"]}]}
+    with _sources(digikey=_answers("Active")):
+        lifecycle_audit.audit_bom(bom, sources=["digikey"], use_cache=False,
+                                  table_path=table)
+    after = read_table(table)
+    assert list(after) == ["nRF52840-QIAA"]
+    # DigiKey alone is 80; the referenced human check agreeing lifts it to 90.
+    assert after["nRF52840-QIAA"]["Computed"] == "90"
+
+
 # -- --no-cache -----------------------------------------------------------
 
 def _run_cli(*argv):

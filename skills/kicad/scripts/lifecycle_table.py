@@ -21,9 +21,14 @@ import re
 import time
 from datetime import datetime, timezone
 
+try:
+    from lifecycle_cache import mpn_key
+except ImportError:  # pragma: no cover - imported as part of a package
+    from .lifecycle_cache import mpn_key  # type: ignore
+
 __all__ = ["SCRIPT_COLUMNS", "USER_COLUMNS", "DEPARTED_TAG", "is_departed",
            "cell",
-           "read_table", "merge_rows", "render_table", "write_table",
+           "read_table", "by_mpn_key", "merge_rows", "render_table", "write_table",
            "parse_date"]
 
 # A part that has left the BOM. Its row survives because someone's research is
@@ -123,6 +128,16 @@ def read_table(path: str) -> dict[str, dict[str, str]]:
     return rows
 
 
+def by_mpn_key(rows: dict[str, dict[str, str]]) -> dict[str, dict[str, str]]:
+    """Table rows indexed the way the cache files parts, by mpn_key().
+
+    The table keeps each part's own spelling for display; matching on that
+    spelling meant a BOM revision that only changed capitalisation lost the
+    row a person had filled in.
+    """
+    return {mpn_key(mpn): row for mpn, row in rows.items()}
+
+
 def merge_rows(existing: dict[str, dict[str, str]],
                findings: dict[str, dict]) -> list[dict[str, str]]:
     """Script columns from this run, user columns from whatever was there.
@@ -134,10 +149,12 @@ def merge_rows(existing: dict[str, dict[str, str]],
     """
     out: list[dict[str, str]] = []
     seen: set[str] = set()
+    prior_by_key = by_mpn_key(existing)
 
     for mpn in sorted(findings):
         f = findings[mpn]
-        prior = existing.get(mpn, {})
+        # Matched case-insensitively; the row takes the BOM's current spelling.
+        prior = prior_by_key.get(mpn_key(mpn), {})
         row = {c: prior.get(c, "") for c in USER_COLUMNS}
         row["MPN"] = mpn
         row["Refs"] = ", ".join(f.get("refs") or [])
@@ -154,10 +171,10 @@ def merge_rows(existing: dict[str, dict[str, str]],
         row["Raw"] = "" if raw is None else "%.2f" % raw
         row["Sources"] = "%d/%d" % (f.get("responding", 0), f.get("capable", 0))
         out.append(row)
-        seen.add(mpn)
+        seen.add(mpn_key(mpn))
 
     for mpn, prior in sorted(existing.items()):
-        if mpn in seen:
+        if mpn_key(mpn) in seen:
             continue
         row = dict(prior)
         row["MPN"] = mpn

@@ -656,6 +656,7 @@ try:  # the cache module sits beside this one; keep working if it is absent
         score as _score,
         RateLimiter as _RateLimiter,
         compute as _compute,
+        mpn_key as _mpn_key,
         DEFAULT_TTL_DAYS as _DEFAULT_TTL_DAYS,
     )
     import lifecycle_table as _table
@@ -667,6 +668,7 @@ except ImportError:  # pragma: no cover
             score as _score,
             RateLimiter as _RateLimiter,
             compute as _compute,
+            mpn_key as _mpn_key,
             DEFAULT_TTL_DAYS as _DEFAULT_TTL_DAYS,
         )
         from . import lifecycle_table as _table  # type: ignore
@@ -1103,13 +1105,15 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
     scoring = _table is not None and _compute is not None
     existing_rows = (_table.read_table(table_path_resolved)
                      if scoring and table_path_resolved else {})
+    existing_by_key = _table.by_mpn_key(existing_rows) if existing_rows else {}
     api_capable = status_capable_count(sources)
 
     def _score(mpn, data):
         """The 0-100 score for one part, or None when scoring is unavailable."""
         if not scoring:
             return None
-        user = _table.user_row(existing_rows.get(mpn, {})) if existing_rows else None
+        user = (_table.user_row(existing_by_key.get(_mpn_key(mpn), {}))
+                if existing_rows else None)
         scored = _compute(data.get("per_source_status") or {}, api_capable, user)
         data["computed_confidence"] = scored
         return scored
