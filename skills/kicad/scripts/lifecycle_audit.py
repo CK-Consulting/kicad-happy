@@ -1002,6 +1002,7 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
               suggest_alternatives: bool = False,
               cache_path: str | None = None,
               ttl_days: float | None = None,
+              use_cache: bool = True,
               concurrency: int = 8,
               confidence_exit: float = 0.90,
               report_threshold: float = 0.80,
@@ -1015,6 +1016,10 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
     ``report_threshold`` confidence — rather than merely attempted, because a
     part that came back unknown from every source has not been audited in any
     sense a reviewer would accept.
+
+    ``use_cache=False`` neither reads nor writes the cache. A zero TTL is not
+    the same thing: it only makes old entries stale, and the run still writes
+    every answer it fetched back to disk.
     """
     bom = analysis_json.get("bom", [])
 
@@ -1047,12 +1052,12 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
     # the sources the next part asks first.
     cache = None
     scheduler = None
-    if _LifecycleCache is not None:
+    run_sources = [s for s in _API_FNS
+                   if (s in sources if sources else s in DEFAULT_SOURCES)]
+    if _LifecycleCache is not None and use_cache:
         path = cache_path or _default_cache_path(project_dir)
         cache = _LifecycleCache(path, ttl_days if ttl_days is not None else _DEFAULT_TTL_DAYS)
-        scheduler = _SourceScheduler(cache, [s for s in _API_FNS
-                                             if (s in sources if sources
-                                                 else s in DEFAULT_SOURCES)])
+        scheduler = _SourceScheduler(cache, run_sources)
     limiter = _RateLimiter(cache) if _RateLimiter is not None else None
 
     ordered_mpns = sorted(mpn_map.items())
@@ -1069,8 +1074,7 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
     scoring = _table is not None and _compute is not None
     existing_rows = (_table.read_table(table_path_resolved)
                      if scoring and table_path_resolved else {})
-    api_capable = len([s for s in (scheduler.sources if scheduler else [])
-                       if s in STATUS_CAPABLE])
+    api_capable = len([s for s in run_sources if s in STATUS_CAPABLE])
 
     def _score(mpn, data):
         """The 0-100 score for one part, or None when scoring is unavailable."""
@@ -1547,8 +1551,9 @@ def main():
                                             if getattr(args, "nexar", False)
                                             else DEFAULT_SOURCES)),
                        delay=args.delay,
-                       cache_path=(None if getattr(args, "no_cache", False) else args.cache_path),
-                       ttl_days=(0.0 if getattr(args, "no_cache", False) else args.ttl_days),
+                       cache_path=args.cache_path,
+                       ttl_days=args.ttl_days,
+                       use_cache=not getattr(args, "no_cache", False),
                        concurrency=args.concurrency,
                        confidence_exit=args.confidence_exit,
                        report_threshold=args.report_threshold,

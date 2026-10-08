@@ -136,6 +136,57 @@ def test_disagreeing_sources_report_the_worst_status_whichever_answers_last():
         assert r["status"] == "obsolete", (active_after, r["status"])
 
 
+# -- --no-cache -----------------------------------------------------------
+
+def _run_cli(*argv):
+    """The audit's CLI against a one-part BOM in a fresh project directory."""
+    proj = tempfile.mkdtemp()
+    analysis = os.path.join(proj, "schematic.json")
+    with open(analysis, "w") as fh:
+        json.dump({"file": os.path.join(proj, "board.kicad_sch"),
+                   "bom": [{"mpn": "TPS62840DLCR", "references": ["U1"]}]}, fh)
+    out = os.path.join(proj, "lifecycle.json")
+    saved = sys.argv
+    sys.argv = ["lifecycle_audit.py", analysis, "--only", "digikey",
+                "-o", out, *argv]
+    try:
+        with _sources(digikey=_answers("Active")):
+            lifecycle_audit.main()
+    finally:
+        sys.argv = saved
+    with open(out) as fh:
+        return proj, json.load(fh)
+
+
+def test_no_cache_writes_no_cache():
+    """The help says "ignore and do not write". It used to write one anyway,
+    at the default path, with every entry it had just fetched."""
+    proj, _ = _run_cli("--no-cache")
+    assert not os.path.exists(os.path.join(proj, "analysis",
+                                           "lifecycle_cache.json"))
+
+
+def test_no_cache_writes_one_without_the_flag():
+    """The control: the same run without the flag does leave a cache."""
+    proj, _ = _run_cli()
+    assert os.path.exists(os.path.join(proj, "analysis", "lifecycle_cache.json"))
+
+
+def test_no_cache_reads_no_cache():
+    """A cached answer must not be served, however fresh, and the file must
+    be left exactly as it was."""
+    path = os.path.join(tempfile.mkdtemp(), "c.json")
+    c = LifecycleCache(path)
+    c.put("TPS62840DLCR", "digikey", {"status": "Obsolete"})
+    c.save()
+    with open(path) as fh:
+        before = fh.read()
+    _, result = _run_cli("--no-cache", "--cache", path)
+    assert result["lifecycle_summary"]["active"] == 1
+    with open(path) as fh:
+        assert fh.read() == before
+
+
 # -- alternatives ---------------------------------------------------------
 
 def test_alternatives_search_runs_without_credentials():

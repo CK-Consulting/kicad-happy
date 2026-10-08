@@ -9576,8 +9576,8 @@ def main():
                 result, project_dir=project_dir,
                 sources=_srcs,
                 concurrency=getattr(args, "lifecycle_concurrency", 8),
-                ttl_days=(0.0 if getattr(args, "no_lifecycle_cache", False)
-                          else getattr(args, "lifecycle_ttl_days", None)),
+                ttl_days=getattr(args, "lifecycle_ttl_days", None),
+                use_cache=not getattr(args, "no_lifecycle_cache", False),
                 table_path=getattr(args, "lifecycle_table", None),
             )
             if lifecycle and lifecycle.get("components_checked", 0) > 0:
