@@ -340,6 +340,48 @@ def test_an_unknown_source_name_is_an_error_not_an_empty_run():
         raise AssertionError("an unknown source was accepted")
 
 
+# -- where the project is -------------------------------------------------
+
+def _current_format_run(*argv):
+    """The CLI on an analyzer JSON of the current shape: no legacy ``file``,
+    the schematic under ``inputs.source_files``, the JSON in a timestamped
+    run directory inside the project."""
+    proj = tempfile.mkdtemp()
+    run = os.path.join(proj, "analysis", "2026-10-08_120000")
+    os.makedirs(run)
+    analysis = os.path.join(run, "schematic.json")
+    with open(analysis, "w") as fh:
+        json.dump({"inputs": {"source_files": [os.path.join(proj, "board.kicad_sch")]},
+                   "bom": [{"mpn": "TPS62840DLCR", "references": ["U1"]}]}, fh)
+    saved = sys.argv
+    sys.argv = ["lifecycle_audit.py", analysis, "--only", "digikey",
+                "-o", os.path.join(tempfile.mkdtemp(), "out.json"), *argv]
+    try:
+        with _sources(digikey=_answers("Active")):
+            lifecycle_audit.main()
+    finally:
+        sys.argv = saved
+    return proj, run
+
+
+def test_the_project_comes_from_the_schematic_not_the_analysis_run():
+    """Without the legacy field the JSON's own directory was taken as the
+    project, so every timestamped run got a fresh cache and its own table."""
+    proj, run = _current_format_run()
+    assert os.path.exists(os.path.join(proj, "analysis", "lifecycle_cache.json"))
+    assert os.path.exists(os.path.join(proj, "lifecycle.md"))
+    assert sorted(os.listdir(run)) == ["schematic.json"]
+
+
+def test_project_and_table_can_be_given_outright():
+    elsewhere = tempfile.mkdtemp()
+    table = os.path.join(tempfile.mkdtemp(), "parts.md")
+    proj, run = _current_format_run("--project", elsewhere, "--table", table)
+    assert os.path.exists(os.path.join(elsewhere, "analysis", "lifecycle_cache.json"))
+    assert os.path.exists(table)
+    assert not os.path.exists(os.path.join(proj, "lifecycle.md"))
+
+
 # -- alternatives ---------------------------------------------------------
 
 def test_alternatives_search_runs_without_credentials():

@@ -1501,6 +1501,22 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
 # CLI
 # ---------------------------------------------------------------------------
 
+def project_dir_from_analysis(analysis: dict, input_path: Path) -> str:
+    """The project an analyzer JSON describes: where its schematic lives.
+
+    The current envelope records the schematic under inputs.source_files and
+    has dropped the legacy top-level ``file``. Falling back to the JSON's own
+    directory put the cache and the lifecycle table inside a timestamped
+    analysis run, so every run started cold and wrote its own table, and the
+    one a person had edited was never read. Legacy JSON still works.
+    """
+    sources = ((analysis.get("inputs") or {}).get("source_files") or [])
+    schematic = sources[0] if sources else analysis.get("file", "")
+    if schematic:
+        return str(Path(schematic).resolve().parent)
+    return str(input_path.parent)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Component lifecycle and temperature audit",
@@ -1538,6 +1554,15 @@ def main():
     parser.add_argument(
         "--cache", dest="cache_path", default=None,
         help="Lifecycle cache file (default: <project>/analysis/lifecycle_cache.json)",
+    )
+    parser.add_argument(
+        "--project", default=None,
+        help="Project directory, for the default cache and table locations "
+             "(default: the directory of the schematic the JSON was built from)",
+    )
+    parser.add_argument(
+        "--table", dest="table_path", default=None,
+        help="Lifecycle table file (default: <project>/lifecycle.md)",
     )
     parser.add_argument(
         "--ttl-days", type=float, default=None,
@@ -1584,9 +1609,7 @@ def main():
     with open(input_path) as f:
         analysis = json.load(f)
 
-    # Resolve project directory from analyzer JSON
-    source_file = analysis.get("file", "")
-    project_dir = str(Path(source_file).parent) if source_file else str(input_path.parent)
+    project_dir = args.project or project_dir_from_analysis(analysis, input_path)
 
     # Parse temperature range
     temp_range = None
@@ -1623,6 +1646,7 @@ def main():
                        cache_path=args.cache_path,
                        ttl_days=args.ttl_days,
                        use_cache=not getattr(args, "no_cache", False),
+                       table_path=args.table_path,
                        concurrency=args.concurrency,
                        confidence_exit=args.confidence_exit,
                        report_threshold=args.report_threshold,
