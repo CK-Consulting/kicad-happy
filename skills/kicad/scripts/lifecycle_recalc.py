@@ -24,7 +24,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from lifecycle_audit import STATUS_CAPABLE, _normalize_status  # noqa: E402
+from lifecycle_audit import (  # noqa: E402
+    STATUS_CAPABLE, _default_cache_path, _default_table_path, _normalize_status,
+)
 from lifecycle_cache import compute, mpn_key  # noqa: E402
 from lifecycle_table import (  # noqa: E402
     read_table, render_table, user_row, is_departed,
@@ -51,6 +53,22 @@ def statuses_from_cache(cache_path: str) -> dict[str, dict[str, str]]:
     return out
 
 
+def default_cache_path(project_dir: str) -> str:
+    """The cache the audit would have written for this project.
+
+    Derived from the audit's own _default_cache_path rather than spelled out
+    here, because a second copy is what drifted: recalc looked only under
+    .pipeline/ while the audit writes <project>/analysis/. The audit is handed
+    the schematic's directory, so where the schematic sits in .pipeline/ the
+    cache is under that instead, and both places are tried.
+    """
+    root = os.path.abspath(project_dir)
+    candidates = [_default_cache_path(root)]
+    if os.path.basename(root) != ".pipeline":
+        candidates.append(_default_cache_path(os.path.join(root, ".pipeline")))
+    return next((c for c in candidates if os.path.exists(c)), candidates[0])
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("project_dir")
@@ -61,10 +79,8 @@ def main() -> int:
                          "(default: every status-capable source)")
     args = ap.parse_args()
 
-    root = os.path.abspath(args.project_dir)
-    cache_path = args.cache or os.path.join(root, ".pipeline", "analysis",
-                                            "lifecycle_cache.json")
-    table_path = args.table or os.path.join(root, "lifecycle.md")
+    cache_path = args.cache or default_cache_path(args.project_dir)
+    table_path = args.table or _default_table_path(args.project_dir)
 
     # An unreadable cache used to come back as an empty dict, and the loop
     # below would then rescore every row to zero and demand an acknowledgement

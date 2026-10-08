@@ -45,6 +45,22 @@ def _recalc(*argv):
         sys.argv = saved
 
 
+def test_finds_the_cache_where_the_audit_writes_it():
+    """For a project root the audit writes <project>/analysis/; recalc looked
+    only under .pipeline/ and reported the cache unreadable."""
+    proj = _project("TPS62840DLCR", ("analysis", "lifecycle_cache.json"))
+    assert _recalc(proj) == 0
+    assert read_table(os.path.join(proj, "lifecycle.md"))["TPS62840DLCR"]["Status"] == "active"
+
+
+def test_still_finds_a_cache_beside_a_schematic_in_pipeline():
+    """Where the schematic sits in .pipeline/, the audit is handed that
+    directory and its cache lands under it."""
+    proj = _project("TPS62840DLCR", (".pipeline", "analysis", "lifecycle_cache.json"))
+    assert _recalc(proj) == 0
+    assert read_table(os.path.join(proj, "lifecycle.md"))["TPS62840DLCR"]["Status"] == "active"
+
+
 def test_a_mixed_case_mpn_finds_its_cached_answers():
     """The cache files keys upper-cased; the table keeps the part's own
     spelling. Looking one up by the other rescored the part as unknown."""
