@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -23,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "kicad" / "scripts"))
 import lifecycle_audit  # noqa: E402
 import lifecycle_recalc  # noqa: E402
 from lifecycle_cache import LifecycleCache  # noqa: E402
-from lifecycle_table import read_table, write_table  # noqa: E402
+from lifecycle_table import read_table, render_table, write_table  # noqa: E402
 
 
 def _project(mpn, cache_rel):
@@ -73,6 +74,32 @@ def test_a_mixed_case_mpn_finds_its_cached_answers():
     assert row["Status"] == "active"
     assert row["Sources"] == "1/1"
 
+
+
+def test_a_human_check_is_scored_when_no_distributor_gave_a_status():
+    """Where only stock-only sources answered, the cache holds no status at
+    all, and a person's referenced check is the only evidence there is. Recalc
+    refused to run on that cache, so the check was never scored."""
+    proj = tempfile.mkdtemp()
+    table = os.path.join(proj, "lifecycle.md")
+    write_table(table, {"MM8108-MF15457": {
+        "refs": ["U1"], "status": "unknown", "computed": 0.0, "raw": 0.0,
+        "responding": 0, "capable": 1, "needs_ack": True}})
+    rows = read_table(table)
+    rows["MM8108-MF15457"].update({"User Status": "active",
+                                   "Reference": "https://morsemicro.com/mm8108",
+                                   "Checked On": time.strftime("%Y-%m-%d")})
+    with open(table, "w", encoding="utf-8") as fh:
+        fh.write(render_table(list(rows.values())))
+    cache = LifecycleCache(os.path.join(proj, "analysis", "lifecycle_cache.json"))
+    cache.put("MM8108-MF15457", "lcsc", {"provides_status": False, "in_stock": True})
+    cache.save()
+
+    assert _recalc(proj) == 0
+    row = read_table(table)["MM8108-MF15457"]
+    assert row["Status"] == "active"
+    assert float(row["Computed"]) > 0
+    assert row["Sources"] == "1/2"
 
 # -- the same score the audit wrote ---------------------------------------
 

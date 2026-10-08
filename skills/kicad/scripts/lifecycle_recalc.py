@@ -98,15 +98,19 @@ def main() -> int:
     # below would then rescore every row to zero and demand an acknowledgement
     # for the whole BOM. Scoring nothing is not the same as scoring badly:
     # without the cache there is nothing to recalculate from, so stop.
+    #
+    # A cache that reads cleanly but holds no status is different. It is what
+    # a run gets when only stock-only sources answered, and the audit scores
+    # exactly that way - so recalc does too, and a person's referenced check
+    # is then the only evidence a row has, which is the case this exists for.
     try:
         cached = statuses_from_cache(cache_path)
     except (OSError, ValueError) as exc:
         print("cannot read %s: %s" % (cache_path, exc), file=sys.stderr)
         return 1
     if not cached:
-        print("no cached statuses in %s - nothing to recalculate from"
+        print("no distributor statuses in %s - scoring on human input alone"
               % cache_path, file=sys.stderr)
-        return 1
 
     rows = read_table(table_path)
     if not rows:
