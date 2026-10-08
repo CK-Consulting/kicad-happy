@@ -348,6 +348,10 @@ def _lcsc_identity(comp: dict) -> tuple[str, str]:
     extra = comp.get("extra") or {}
     mpn = extra.get("mpn") or comp.get("mfr") or ""
     manufacturer = extra.get("manufacturer") or comp.get("manufacturer") or ""
+    if isinstance(manufacturer, dict):
+        # The nested shape carries the manufacturer as {"id": …, "name": …};
+        # str() of that is a Python repr, not a name.
+        manufacturer = manufacturer.get("name") or ""
     return str(mpn), str(manufacturer)
 
 

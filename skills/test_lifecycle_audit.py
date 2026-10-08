@@ -483,6 +483,17 @@ def test_alternatives_read_the_current_flat_lcsc_response():
     assert alts[0]["lcsc_stock"] == 120
 
 
+
+def test_a_nested_manufacturer_object_yields_its_name():
+    """The nested response carries the manufacturer as {"id", "name"}; it was
+    being stringified whole into a Python repr."""
+    lcsc = {"components": [{"stock": 5, "extra": {
+        "mpn": "GRM188R71C104KA01D", "manufacturer": {"id": 4, "name": "Murata Electronics"}}}]}
+    with _no_credentials(), _transport(lcsc):
+        alts = lifecycle_audit.find_alternatives("GRM188R71C104KA01J", ["lcsc"], delay=0)
+    assert alts[0]["manufacturer"] == "Murata Electronics"
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
