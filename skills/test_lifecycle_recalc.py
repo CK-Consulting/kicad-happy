@@ -179,6 +179,50 @@ def test_a_stale_answer_from_a_source_the_audit_dropped_is_not_scored():
     assert recalced["Status"] == "active"
     assert _scores(recalced) == _scores(audited)
 
+
+# -- freshness ------------------------------------------------------------
+
+def _aged_project(age_days, ttl_days=None):
+    """One cached DigiKey "active", fetched age_days ago."""
+    proj = _project("TPS62840DLCR", ("analysis", "lifecycle_cache.json"))
+    path = os.path.join(proj, "analysis", "lifecycle_cache.json")
+    with open(path) as fh:
+        blob = json.load(fh)
+    for row in blob["entries"].values():
+        row["fetched_at"] = time.time() - age_days * 86400
+    if ttl_days is not None:
+        blob["ttl_days"] = ttl_days
+    with open(path, "w") as fh:
+        json.dump(blob, fh)
+    return proj
+
+
+def _status_after_recalc(proj, *argv):
+    assert _recalc(proj, *argv) == 0
+    return read_table(os.path.join(proj, "lifecycle.md"))["TPS62840DLCR"]["Status"]
+
+
+def test_an_expired_answer_is_not_rescored_as_current():
+    """The audit would refuse a 60-day-old answer under its 45-day TTL; recalc
+    read it regardless and kept writing that status into the table."""
+    assert _status_after_recalc(_aged_project(60)) == "unknown"
+    assert _status_after_recalc(_aged_project(10)) == "active"
+
+
+def test_recalc_uses_the_ttl_the_audit_ran_with():
+    """An audit run with --ttl-days 90 still accepts a 60-day-old answer, and
+    records that, so recalc must too; --ttl-days overrides it either way."""
+    assert _status_after_recalc(_aged_project(60, ttl_days=90)) == "active"
+    assert _status_after_recalc(_aged_project(60, ttl_days=90),
+                                "--ttl-days", "30") == "unknown"
+
+
+def test_the_audit_records_its_ttl_with_the_cache():
+    proj = tempfile.mkdtemp()
+    _audit(proj, "--ttl-days", "90", digikey="Active")
+    with open(os.path.join(proj, "analysis", "lifecycle_cache.json")) as fh:
+        assert json.load(fh)["ttl_days"] == 90
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

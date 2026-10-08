@@ -139,6 +139,7 @@ class LifecycleCache:
 
     def __init__(self, path: str, ttl_days: float = DEFAULT_TTL_DAYS) -> None:
         self.path = path
+        self.ttl_days = ttl_days
         self.ttl = ttl_days * 86400.0
         self._entries: dict[str, dict] = {}
         self._timing: dict[str, dict] = {}
@@ -170,6 +171,7 @@ class LifecycleCache:
             "saved_at": time.time(),
             "entries": self._entries,
             "timing": self._timing,
+            "ttl_days": self.ttl_days,
         }
         if self.sources is not None:
             blob["sources"] = list(self.sources)
@@ -195,13 +197,16 @@ class LifecycleCache:
     def _key(mpn: str, source: str) -> str:
         return "%s\x1f%s" % (mpn_key(mpn), source)
 
+    def _fresh(self, row: dict) -> bool:
+        """The one freshness rule: younger than the TTL."""
+        return time.time() - row.get("fetched_at", 0) <= self.ttl
+
     def get(self, mpn: str, source: str) -> dict | None:
         row = self._entries.get(self._key(mpn, source))
         if row is None:
             self.misses += 1
             return None
-        age = time.time() - row.get("fetched_at", 0)
-        if age > self.ttl:
+        if not self._fresh(row):
             self.stale += 1
             return None
         self.hits += 1
@@ -233,7 +238,7 @@ class LifecycleCache:
                 if count:
                     self.misses += 1
                 continue
-            if time.time() - row.get("fetched_at", 0) > self.ttl:
+            if not self._fresh(row):
                 if count:
                     self.stale += 1
                 continue
@@ -241,6 +246,19 @@ class LifecycleCache:
                 self.hits += 1
             out[src] = row.get("data")
         return out
+
+    def fresh_answers(self) -> Iterable[tuple[str, str, dict | None]]:
+        """Every answer still within the TTL, as (mpn_key, source, data).
+
+        For readers of the whole cache, such as the recalculation, so that
+        they judge freshness by the same rule the audit does rather than
+        serving an answer the audit would refuse.
+        """
+        for key, row in self._entries.items():
+            if "\x1f" not in key or not isinstance(row, dict) or not self._fresh(row):
+                continue
+            mpn, source = key.split("\x1f", 1)
+            yield mpn, source, row.get("data")
 
     # -- timing ------------------------------------------------------------
 

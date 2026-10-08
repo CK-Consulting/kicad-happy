@@ -28,34 +28,38 @@ from lifecycle_audit import (  # noqa: E402
     _default_cache_path, _default_table_path, _normalize_status,
     run_sources, status_capable_count,
 )
-from lifecycle_cache import compute, mpn_key  # noqa: E402
+from lifecycle_cache import (  # noqa: E402
+    DEFAULT_TTL_DAYS, LifecycleCache, compute, mpn_key,
+)
 from lifecycle_table import (  # noqa: E402
     read_table, render_table, user_row, is_departed,
 )
 
-SEP = "\x1f"
+def open_cache(cache_path: str, ttl_days: float | None = None) -> LifecycleCache:
+    """The audit's cache, judged by the TTL the audit ran with.
 
-
-def recorded_sources(cache_path: str) -> list[str] | None:
-    """The source set the audit that wrote this cache asked, if it said."""
-    try:
-        with open(cache_path) as fh:
-            sources = json.load(fh).get("sources")
-    except (OSError, ValueError, AttributeError):
-        return None
-    return list(sources) if isinstance(sources, list) and sources else None
-
-
-def statuses_from_cache(cache_path: str) -> dict[str, dict[str, str]]:
-    """Every cached answer, as {mpn_key(mpn): {source: normalised status}}."""
+    Raises when the file cannot be read or parsed: LifecycleCache treats that
+    as an empty cache, which for a rescore would mean zeroing every row.
+    """
     with open(cache_path) as fh:
         blob = json.load(fh)
+    if not isinstance(blob, dict):
+        raise ValueError("not a lifecycle cache")
+    if ttl_days is None:
+        recorded = blob.get("ttl_days")
+        ttl_days = (float(recorded) if isinstance(recorded, (int, float))
+                    else DEFAULT_TTL_DAYS)
+    return LifecycleCache(cache_path, ttl_days)
+
+
+def statuses_from_cache(cache: LifecycleCache) -> dict[str, dict[str, str]]:
+    """Every fresh cached answer, as {mpn_key(mpn): {source: normalised status}}.
+
+    Freshness is the cache's own rule. Reading entries regardless of age kept
+    an answer the audit had long since refused in the table indefinitely.
+    """
     out: dict[str, dict[str, str]] = {}
-    for key, row in (blob.get("entries") or {}).items():
-        if SEP not in key:
-            continue
-        mpn, source = key.split(SEP, 1)
-        data = (row or {}).get("data")
+    for mpn, source, data in cache.fresh_answers():
         if not isinstance(data, dict):
             continue
         status = _normalize_status(data.get("status"))
@@ -89,6 +93,9 @@ def main() -> int:
                     help="Comma-separated source set the scores assume "
                          "(default: the set the audit recorded in the cache, "
                          "else the audit's default sources)")
+    ap.add_argument("--ttl-days", type=float, default=None,
+                    help="How long a cached answer stays fresh (default: the "
+                         "TTL the audit recorded, else %d)" % DEFAULT_TTL_DAYS)
     args = ap.parse_args()
 
     cache_path = args.cache or default_cache_path(args.project_dir)
@@ -104,7 +111,8 @@ def main() -> int:
     # exactly that way - so recalc does too, and a person's referenced check
     # is then the only evidence a row has, which is the case this exists for.
     try:
-        cached = statuses_from_cache(cache_path)
+        cache = open_cache(cache_path, args.ttl_days)
+        cached = statuses_from_cache(cache)
     except (OSError, ValueError) as exc:
         print("cannot read %s: %s" % (cache_path, exc), file=sys.stderr)
         return 1
@@ -122,7 +130,7 @@ def main() -> int:
     # which a default audit never queries, so one active DigiKey answer the
     # audit scored 80 came back from here as 57 and awaiting acknowledgement.
     sources = ([s.strip() for s in args.sources.split(",") if s.strip()]
-               if args.sources else recorded_sources(cache_path))
+               if args.sources else cache.sources)
     capable = status_capable_count(sources)
     # Only those sources' answers count, too. The cache is shared across runs,
     # so a Nexar answer from an opt-in run outlives it; the default audit after
