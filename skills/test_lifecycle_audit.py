@@ -136,6 +136,51 @@ def test_disagreeing_sources_report_the_worst_status_whichever_answers_last():
         assert r["status"] == "obsolete", (active_after, r["status"])
 
 
+# -- which temperature range is reported ----------------------------------
+
+_DIGIKEY_RANGE = {"status": "Active", "temp_min_c": -40.0, "temp_max_c": 85.0}
+_MOUSER_RANGE = {"temp_min_c": -20.0, "temp_max_c": 105.0,
+                 "provides_status": False}
+
+
+def _ranged(data, after=0.0):
+    def query(mpn, timeout=10.0):
+        time.sleep(after)
+        return dict(data)
+    return query
+
+
+def _reported_range(r):
+    t = r["temperature"]
+    return t["temp_min_c"], t["temp_max_c"]
+
+
+def test_disagreeing_temperature_ranges_settle_the_same_way_in_any_order():
+    """The first response carrying a range used to win outright, so whether a
+    part passed a -40..105 design depended on which distributor was faster."""
+    for digikey_after, mouser_after in ((0.0, 0.05), (0.05, 0.0)):
+        with _sources(digikey=_ranged(_DIGIKEY_RANGE, digikey_after),
+                      mouser=_ranged(_MOUSER_RANGE, mouser_after)):
+            r = lifecycle_audit.audit_component("TPS62840DLCR",
+                                                ["digikey", "mouser"])
+        assert _reported_range(r) == (-20.0, 85.0), (digikey_after, r["temperature"])
+
+
+def test_a_cached_run_reports_the_range_a_fetched_one_does():
+    """Cached answers were consumed in source order, so a re-run from the
+    cache could pass a part the fetching run had failed, or the reverse."""
+    c = _cache()
+    c.put("TPS62840DLCR", "digikey", _DIGIKEY_RANGE)
+    c.put("TPS62840DLCR", "mouser", _MOUSER_RANGE)
+    with _sources(digikey=_ranged(_DIGIKEY_RANGE), mouser=_ranged(_MOUSER_RANGE)):
+        r = lifecycle_audit.audit_component("TPS62840DLCR",
+                                            ["digikey", "mouser"], cache=c)
+    assert r["cache_hits"] == 2
+    assert _reported_range(r) == (-20.0, 85.0)
+    assert r["temperature"]["ranges"] == {"digikey": [-40.0, 85.0],
+                                          "mouser": [-20.0, 105.0]}
+
+
 # -- --no-cache -----------------------------------------------------------
 
 def _run_cli(*argv):

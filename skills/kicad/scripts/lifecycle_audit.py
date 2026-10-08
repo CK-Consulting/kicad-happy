@@ -798,6 +798,7 @@ def audit_component(mpn: str, sources: list[str], project_dir: str | None = None
     result = {"mpn": mpn, "sources": {}}
     per_source_status: dict[str, str] = {}
     temp_data = None
+    source_ranges: dict[str, tuple[float, float]] = {}
 
     wanted = run_sources(sources)
 
@@ -808,19 +809,14 @@ def audit_component(mpn: str, sources: list[str], project_dir: str | None = None
             temp_data = ext_temp
 
     def absorb(source_name: str, data: dict | None) -> None:
-        nonlocal temp_data
         if not data:
             return
         result["sources"][source_name] = data
         raw_status = data.get("status")
         if raw_status:
             per_source_status[source_name] = _normalize_status(raw_status)
-        if not temp_data and data.get("temp_min_c") is not None:
-            temp_data = {
-                "temp_min_c": data["temp_min_c"],
-                "temp_max_c": data["temp_max_c"],
-                "source": f"api:{source_name}",
-            }
+        if data.get("temp_min_c") is not None and data.get("temp_max_c") is not None:
+            source_ranges[source_name] = (data["temp_min_c"], data["temp_max_c"])
 
     # Source zero. A cached answer costs nothing and is the reason a re-run
     # during a design session should not touch the network at all.
@@ -876,6 +872,24 @@ def audit_component(mpn: str, sources: list[str], project_dir: str | None = None
     has_active = any(s == "active" for s in per_source_status.values())
     has_non_active = any(s in _non_active for s in per_source_status.values())
     result["consensus_split"] = has_active and has_non_active
+    # Distributor ranges are combined only after every answer is in, by the
+    # conservative rule: the highest minimum and the lowest maximum any source
+    # states, i.e. the range all of them agree the part covers. Taking the
+    # first range to arrive made pass/fail depend on which request was faster,
+    # and on whether the run was fetched or served from the cache. A fixed
+    # source precedence would be stable too, but would still pass a design on
+    # one distributor's word while another rates the part narrower - and
+    # telling someone a part covers a range it may not is the expensive error.
+    # Ranges that do not overlap at all leave the minimum above the maximum,
+    # which fails any design range - right for data that contradicts itself.
+    # A datasheet extraction, read first above, still outranks all of them.
+    if not temp_data and source_ranges:
+        temp_data = {
+            "temp_min_c": max(lo for lo, _ in source_ranges.values()),
+            "temp_max_c": min(hi for _, hi in source_ranges.values()),
+            "source": "api:" + "+".join(sorted(source_ranges)),
+            "ranges": {s: list(r) for s, r in sorted(source_ranges.items())},
+        }
     result["per_source_status"] = per_source_status
     result["cache_hits"] = cache_hits
     if _score is not None:
