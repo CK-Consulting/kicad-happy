@@ -681,6 +681,9 @@ except ImportError:  # pragma: no cover
         _table = None  # type: ignore
         _DEFAULT_TTL_DAYS = 45
 
+        def _mpn_key(mpn: str) -> str:  # type: ignore[misc]
+            return mpn.strip().upper()
+
 
 def _default_table_path(project_dir: str | None) -> str | None:
     """Where the project's lifecycle table lives.
@@ -1055,6 +1058,9 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
 
     # Extract unique MPNs
     mpn_map = {}  # mpn -> list of references
+    # One part however the BOM capitalises it, as the cache and table see it;
+    # the first spelling met is the one reported.
+    spelling: dict[str, str] = {}
     skipped = 0
     for entry in bom:
         if entry.get("dnp"):
@@ -1065,6 +1071,7 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
         if not _is_real_mpn(mpn):
             skipped += 1
             continue
+        mpn = spelling.setdefault(_mpn_key(mpn), mpn)
         mpn_map.setdefault(mpn, []).extend(entry.get("references", []))
 
     lifecycle_findings = []

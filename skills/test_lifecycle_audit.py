@@ -227,6 +227,22 @@ def test_a_human_check_still_counts_after_the_bom_respells_the_mpn():
     assert after["nRF52840-QIAA"]["Computed"] == "90"
 
 
+def test_one_part_spelled_two_ways_in_the_bom_is_one_part():
+    """Two BOM lines differing only in case were audited as two parts and
+    written as two rows the table then reads back as one."""
+    from lifecycle_table import read_table
+    table = os.path.join(tempfile.mkdtemp(), "lifecycle.md")
+    bom = {"bom": [{"mpn": "nRF52840-QIAA", "references": ["U1"]},
+                   {"mpn": "NRF52840-QIAA", "references": ["U2"]}]}
+    with _sources(digikey=_answers("Active")):
+        r = lifecycle_audit.audit_bom(bom, sources=["digikey"], use_cache=False,
+                                      table_path=table)
+    assert r["components_checked"] == 1
+    rows = read_table(table)
+    assert list(rows) == ["nRF52840-QIAA"]
+    assert rows["nRF52840-QIAA"]["Refs"] == "U1, U2"
+
+
 # -- --no-cache -----------------------------------------------------------
 
 def _run_cli(*argv, only=("--only", "digikey"), fns=None):
