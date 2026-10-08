@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
@@ -71,6 +72,26 @@ def _no_credentials():
         os.environ.update(saved)
 
 
+@contextmanager
+def _sources(**fns):
+    """Stand-in query functions, by source name, for the length of a block."""
+    saved = dict(lifecycle_audit._API_FNS)
+    lifecycle_audit._API_FNS.clear()
+    lifecycle_audit._API_FNS.update(fns)
+    try:
+        yield
+    finally:
+        lifecycle_audit._API_FNS.clear()
+        lifecycle_audit._API_FNS.update(saved)
+
+
+def _answers(status, after=0.0):
+    def query(mpn, timeout=10.0):
+        time.sleep(after)
+        return {"status": status}
+    return query
+
+
 # -- what gets cached -----------------------------------------------------
 
 def test_a_failed_request_is_not_cached_as_a_negative_answer():
@@ -98,6 +119,21 @@ def test_a_confirmed_miss_is_still_cached():
     with _transport({"components": []}):
         lifecycle_audit.audit_component("TPS62840DLCR", ["lcsc"], cache=c)
     assert c.covered("TPS62840DLCR", ["lcsc"], count=False) == {"lcsc": None}
+
+
+# -- which status is reported ---------------------------------------------
+
+def test_disagreeing_sources_report_the_worst_status_whichever_answers_last():
+    """The reported status used to be whichever request finished last, so the
+    same part could read active on one run and obsolete on the next."""
+    for obsolete_after, active_after in ((0.0, 0.05), (0.05, 0.0)):
+        with _sources(digikey=_answers("Obsolete", obsolete_after),
+                      nexar=_answers("Active", active_after)):
+            r = lifecycle_audit.audit_component("LM1117IMP-3.3",
+                                                ["digikey", "nexar"])
+        assert r["per_source_status"] == {"digikey": "obsolete",
+                                          "nexar": "active"}
+        assert r["status"] == "obsolete", (active_after, r["status"])
 
 
 # -- alternatives ---------------------------------------------------------

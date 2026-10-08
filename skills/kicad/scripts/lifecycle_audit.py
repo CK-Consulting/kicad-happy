@@ -781,7 +781,6 @@ def audit_component(mpn: str, sources: list[str], project_dir: str | None = None
     per-source deadline now does the rate-limiting job it was standing in for.
     """
     result = {"mpn": mpn, "sources": {}}
-    best_status = "unknown"
     per_source_status: dict[str, str] = {}
     temp_data = None
 
@@ -795,16 +794,13 @@ def audit_component(mpn: str, sources: list[str], project_dir: str | None = None
             temp_data = ext_temp
 
     def absorb(source_name: str, data: dict | None) -> None:
-        nonlocal best_status, temp_data
+        nonlocal temp_data
         if not data:
             return
         result["sources"][source_name] = data
         raw_status = data.get("status")
         if raw_status:
-            normalized = _normalize_status(raw_status)
-            per_source_status[source_name] = normalized
-            if normalized != "unknown":
-                best_status = normalized
+            per_source_status[source_name] = _normalize_status(raw_status)
         if not temp_data and data.get("temp_min_c") is not None:
             temp_data = {
                 "temp_min_c": data["temp_min_c"],
@@ -853,7 +849,15 @@ def audit_component(mpn: str, sources: list[str], project_dir: str | None = None
                         cache.put(mpn, source_name, data)
                 absorb(source_name, data)
 
-    result["status"] = best_status
+    # The worst status any source reports, as score() decides it. Taking the
+    # last one absorbed made the answer depend on which request happened to
+    # finish last, so a part DigiKey and Nexar disagree on flipped between
+    # active and obsolete from run to run.
+    if _score is not None:
+        result["status"] = _score(per_source_status)["status"]
+    else:
+        result["status"] = next((per_source_status[s] for s in sorted(per_source_status)
+                                 if per_source_status[s] != "unknown"), "unknown")
     _non_active = {"obsolete", "discontinued", "last_time_buy", "nrnd"}
     has_active = any(s == "active" for s in per_source_status.values())
     has_non_active = any(s in _non_active for s in per_source_status.values())
