@@ -260,6 +260,8 @@ def extract_lib_symbols(root: list) -> dict:
                 if isinstance(child, list) and len(child) >= 3 and child[0] == "pin"]
 
     symbols = {}
+    # name -> the bare parent name in its (extends "Parent"), for a second pass.
+    derived: dict[str, str] = {}
     for sym in find_all(lib_symbols_node, "symbol"):
         name = sym[1] if len(sym) > 1 else "unknown"
         # Skip sub-unit symbols (e.g., "Device:C_0_1", "Device:C_1_1")
@@ -326,6 +328,18 @@ def extract_lib_symbols(root: list) -> dict:
             if alts:
                 alternates[pin_num] = alts
 
+        # KiCad draws most specific part numbers as a shell over a generic body:
+        # 2N7002 extends Q_NMOS_GSD, BQ27441DRZR-G1A extends BQ27441-G1,
+        # PAM8302AAS extends PAM8302AAD. The shell carries no pins of its own,
+        # so everything above reports zero for it — and a part with no pins is
+        # read as a part nothing connects to, which turns every net that reaches
+        # it into a single-pin net in the report. The parent is in this same
+        # lib_symbols section; the link is resolved in the pass below.
+        for child in sym:
+            if isinstance(child, list) and len(child) >= 2 and child[0] == "extends":
+                derived[name] = str(child[1])
+                break
+
         symbols[name] = {
             "pins": all_pins,
             "unit_pins": unit_pins if unit_pins else None,
@@ -337,6 +351,31 @@ def extract_lib_symbols(root: list) -> dict:
             "ki_fp_filters": ki_fp_filters,
             "alternates": alternates if alternates else None,
         }
+
+    # Second pass: give each derived shell the pins of whatever it extends.
+    # Done after the loop because a parent may appear later in the section than
+    # its child, and a parent may itself be derived — hence the walk, with a
+    # seen-set so a malformed library cannot spin here.
+    for child_name, parent_bare in derived.items():
+        entry = symbols.get(child_name)
+        if not entry or entry["pins"]:
+            continue  # already has its own pins; nothing to inherit
+        lib = child_name.split(":")[0] if ":" in child_name else ""
+        current = f"{lib}:{parent_bare}" if lib else parent_bare
+        seen: set[str] = set()
+        while current and current not in seen:
+            seen.add(current)
+            parent = symbols.get(current)
+            if parent is None:
+                break  # parent not in this schematic — leave the shell empty
+            if parent["pins"]:
+                entry["pins"] = parent["pins"]
+                entry["unit_pins"] = parent["unit_pins"]
+                if not entry.get("alternates"):
+                    entry["alternates"] = parent.get("alternates")
+                break
+            nxt = derived.get(current)
+            current = (f"{lib}:{nxt}" if lib else nxt) if nxt else None
 
     return symbols
 
@@ -1356,9 +1395,20 @@ def build_net_map(components: list[dict], wires: list[dict], labels: list[dict],
         point_info.setdefault(k, []).append(info)
         return k
 
-    # Add component pins (skip PWR_FLAG — it's an ERC marker, not a real connection)
+    # Add component pins. PWR_FLAG included: it has exactly one pin, so it can
+    # only ever land on the net already at that point and never joins two
+    # nets — the "ERC marker, not a real connection" worry was about
+    # joining, and a single point cannot join anything. It has to be in the
+    # map because audit_rail_sources and audit_pwr_flags decide a rail is
+    # sourced by finding a #FLG pin *in this map*; skipping it here meant
+    # every correctly flagged rail was reported as having no declared
+    # source while KiCad's own ERC passed it. Consumers that want physical
+    # pins only already filter #FLG/#PWR (netlist_queries, get_net_neighbors,
+    # the multi-driver check). Regular power symbols (#PWR) were always added
+    # here and their names arrive through `power_symbols`; PWR_FLAG's own
+    # name is dropped there because "PWR_FLAG" is not a rail.
     for comp in components:
-        if comp.get("value") == "PWR_FLAG" or comp.get("type") == "power_flag":
+        if comp.get("type") == "power_flag":
             continue
         sheet = comp.get("_sheet", 0)
         for pin in comp.get("pins", []):
@@ -9351,6 +9401,19 @@ def main():
                         help="Root .kicad_sch for hierarchy context (auto-discovered if omitted)")
     parser.add_argument("--no-hierarchy", action="store_true",
                         help="Disable hierarchy auto-discovery (treat file as standalone root)")
+    parser.add_argument("--nexar", action="store_true",
+                        help="Include Nexar in the lifecycle audit. OFF by default: "
+                             "an evaluation licence caps part lookups for the life "
+                             "of the key, so this must be asked for")
+    parser.add_argument("--lifecycle-concurrency", type=int, default=8,
+                        help="Parts fetched at once during the lifecycle audit (default: 8)")
+    parser.add_argument("--lifecycle-ttl-days", type=float, default=None,
+                        help="How long a cached distributor answer stays fresh")
+    parser.add_argument("--no-lifecycle-cache", action="store_true",
+                        help="Ignore and do not write the lifecycle cache")
+    parser.add_argument("--lifecycle-table", default=None,
+                        help="Path to the project's lifecycle table "
+                             "(default: <project>/lifecycle.md)")
     parser.add_argument("--lifecycle", action="store_true",
                         help="Run lifecycle/obsolescence audit (requires network + API keys)")
     parser.add_argument("--analysis-dir", default=None,
@@ -9506,7 +9569,17 @@ def main():
         try:
             from lifecycle_audit import audit_bom
             project_dir = str(Path(args.schematic).parent)
-            lifecycle = audit_bom(result, project_dir=project_dir)
+            from lifecycle_audit import DEFAULT_SOURCES
+            _srcs = (DEFAULT_SOURCES + ["nexar"]
+                     if getattr(args, "nexar", False) else DEFAULT_SOURCES)
+            lifecycle = audit_bom(
+                result, project_dir=project_dir,
+                sources=_srcs,
+                concurrency=getattr(args, "lifecycle_concurrency", 8),
+                ttl_days=getattr(args, "lifecycle_ttl_days", None),
+                use_cache=not getattr(args, "no_lifecycle_cache", False),
+                table_path=getattr(args, "lifecycle_table", None),
+            )
             if lifecycle and lifecycle.get("components_checked", 0) > 0:
                 result["lifecycle_audit"] = lifecycle
                 print(f"Lifecycle: {lifecycle.get('lifecycle_summary', {})}", file=sys.stderr)

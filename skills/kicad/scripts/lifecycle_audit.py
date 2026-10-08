@@ -89,6 +89,14 @@ _STATUS_NORMALIZE = {
     "new product": "active",
     "end of life": "obsolete",
     "factory special order": "active",
+    # Nexar / Octopart. Their value carries a freshness suffix - "Production
+    # (Last Updated: 2 weeks ago)" - which the normaliser strips before lookup.
+    "production": "active",
+    "new product": "active",
+    "not recommended for new designs": "nrnd",
+    "end of life": "obsolete",
+    "obsolete": "obsolete",
+    "last time buy": "last_time_buy",
     # Generic
     "nrnd": "nrnd",
     "eol": "obsolete",
@@ -97,10 +105,18 @@ _STATUS_NORMALIZE = {
 
 
 def _normalize_status(raw: str | None) -> str:
-    """Normalize a lifecycle status string to a standard value."""
+    """Normalize a lifecycle status string to a standard value.
+
+    Sources decorate the word. Nexar returns "Production (Last Updated: 2
+    weeks ago)", which carries useful provenance and no extra meaning, so the
+    parenthetical is dropped before the lookup rather than turning a perfectly
+    good status into "unknown".
+    """
     if not raw:
         return "unknown"
-    return _STATUS_NORMALIZE.get(raw.lower().strip(), "unknown")
+    text = raw.lower().strip()
+    text = re.sub(r"\s*\(.*?\)\s*$", "", text).strip()
+    return _STATUS_NORMALIZE.get(text, "unknown")
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +167,21 @@ def _is_real_mpn(mpn: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# A source that could not answer
+# ---------------------------------------------------------------------------
+
+class SourceUnavailable(Exception):
+    """A source could not be asked: no credentials, a timeout, an HTTP error.
+
+    Distinct from a query returning None, which means the source answered and
+    does not carry the part. The two used to look the same, so a missing key
+    or a slow afternoon was cached for the whole TTL as "not carried", and
+    adding the key afterwards changed nothing until the cache expired. Only an
+    answer is worth remembering; this is the absence of one.
+    """
+
+
+# ---------------------------------------------------------------------------
 # DigiKey API (OAuth 2.0)
 # ---------------------------------------------------------------------------
 
@@ -191,11 +222,11 @@ def _get_digikey_token() -> tuple[str, str] | None:
         return None
 
 
-def query_lifecycle_digikey(mpn: str) -> dict | None:
+def query_lifecycle_digikey(mpn: str, timeout: float = 10.0) -> dict | None:
     """Query DigiKey for lifecycle and temperature data."""
     auth = _get_digikey_token()
     if not auth:
-        return None
+        raise SourceUnavailable("digikey: no credentials, or no token issued")
     token, client_id = auth
 
     try:
@@ -209,10 +240,10 @@ def query_lifecycle_digikey(mpn: str) -> dict | None:
                 "Content-Type": "application/json",
             },
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
-    except (urllib.error.URLError, OSError, json.JSONDecodeError):
-        return None
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        raise SourceUnavailable("digikey: %s" % exc) from exc
 
     for product in data.get("Products", []):
         prod_mpn = product.get("ManufacturerProductNumber", "")
@@ -249,11 +280,11 @@ def query_lifecycle_digikey(mpn: str) -> dict | None:
 # Mouser API
 # ---------------------------------------------------------------------------
 
-def query_lifecycle_mouser(mpn: str) -> dict | None:
+def query_lifecycle_mouser(mpn: str, timeout: float = 10.0) -> dict | None:
     """Query Mouser for lifecycle and temperature data."""
     api_key = os.environ.get("MOUSER_SEARCH_API_KEY") or os.environ.get("MOUSER_PART_API_KEY")
     if not api_key:
-        return None
+        raise SourceUnavailable("mouser: no API key")
 
     try:
         body = json.dumps({
@@ -264,14 +295,24 @@ def query_lifecycle_mouser(mpn: str) -> dict | None:
         }).encode()
         url = f"https://api.mouser.com/api/v1/search/partnumber?apiKey={api_key}"
         req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
-    except (urllib.error.URLError, OSError, json.JSONDecodeError):
-        return None
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        raise SourceUnavailable("mouser: %s" % exc) from exc
 
     for part in data.get("SearchResults", {}).get("Parts", []):
         result = {}
         result["status"] = part.get("LifecycleStatus")
+        # On the tier this key reaches, LifecycleStatus and ProductStatus come
+        # back null on every part while Availability and pricing are populated.
+        # Saying so is better than letting a null masquerade as a silent
+        # source that might have agreed with DigiKey: the confidence model
+        # should know this source cannot vote, not think it abstained.
+        if not result["status"]:
+            result["provides_status"] = False
+            avail = part.get("Availability") or ""
+            if avail:
+                result["availability"] = avail
         result["discontinued"] = str(part.get("IsDiscontinued", "")).lower() == "true"
         result["lead_time"] = part.get("LeadTime")
         result["suggested_replacement"] = part.get("SuggestedReplacement")
@@ -295,28 +336,43 @@ def query_lifecycle_mouser(mpn: str) -> dict | None:
 # LCSC (no auth)
 # ---------------------------------------------------------------------------
 
-def query_lifecycle_lcsc(mpn: str) -> dict | None:
+def query_lifecycle_lcsc(mpn: str, timeout: float = 10.0) -> dict | None:
     """Query LCSC for availability and temperature data."""
     try:
         url = f"https://jlcsearch.tscircuit.com/api/search?q={urllib.parse.quote(mpn)}&limit=3&full=true"
         req = urllib.request.Request(url, headers={"User-Agent": "kicad-happy-lifecycle/1.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
-    except (urllib.error.URLError, OSError, json.JSONDecodeError):
-        return None
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        raise SourceUnavailable("lcsc: %s" % exc) from exc
 
+    # The upstream response used to nest a part under "extra" with its own
+    # mpn and attributes. It now returns the fields flat — description, mfr,
+    # lcsc, package, price, stock — so the old reader found no "extra", took
+    # comp_mpn as empty, skipped every component and returned None for every
+    # part on the board. It failed silently, which is the worst way for a
+    # source to fail: the audit reported a clean run with one fewer opinion in
+    # it and nothing said so.
+    needle = mpn.upper()[:6]
     for comp in data.get("components", []):
-        extra = comp.get("extra", {})
-        comp_mpn = extra.get("mpn", "")
-        if not comp_mpn or not comp_mpn.upper().startswith(mpn.upper()[:6]):
+        extra = comp.get("extra") or {}
+        haystack = " ".join(str(comp.get(k) or "") for k in
+                            ("mfr", "description", "lcsc")).upper()
+        comp_mpn = (extra.get("mpn") or comp.get("mfr") or "").upper()
+        if needle not in haystack and not comp_mpn.startswith(needle):
             continue
 
         result = {}
-        stock = comp.get("stock", 0)
+        stock = comp.get("stock", 0) or 0
         result["in_stock"] = stock > 0
         result["stock_qty"] = stock
+        # No lifecycle status is available from this source; it speaks to
+        # stock and temperature only. Saying so explicitly keeps it out of the
+        # confidence model's numerator rather than looking like a silent
+        # source that might have agreed.
+        result["provides_status"] = False
 
-        attrs = extra.get("attributes", {})
+        attrs = extra.get("attributes") or {}
         for k, v in attrs.items():
             if "operating temperature" in k.lower() and v:
                 temp = _parse_temp_range(v)
@@ -334,44 +390,202 @@ def query_lifecycle_lcsc(mpn: str) -> dict | None:
 # element14 API
 # ---------------------------------------------------------------------------
 
-def query_lifecycle_element14(mpn: str) -> dict | None:
-    """Query element14 for lifecycle and temperature data."""
+def query_lifecycle_element14(mpn: str, timeout: float = 10.0,
+                              store: str | None = None) -> dict | None:
+    """Query element14 for availability and temperature data.
+
+    Rebuilt against the documented request shape on 2026-09-20. The previous
+    version returned None for every part because it sent
+    ``storeInfo.id=us.newark.com``, which is not a store element14 recognises —
+    the identifiers are ``www.newark.com`` and ``uk.farnell.com`` — and omitted
+    ``callInfo.responseDataFormat``. The API answered 400 to all of it, the
+    caller swallowed the HTTPError as an ordinary URLError, and the audit
+    recorded a silent abstention rather than a broken request.
+
+    Note what this source does *not* return. ``productStatus`` holds values
+    like STOCKED and DIRECT_SHIP, which describe how element14 fulfils an
+    order rather than where the part sits in its life. Mapping those onto
+    active/obsolete would be inventing a lifecycle opinion, so the result is
+    marked as carrying no status and the confidence model leaves it out of the
+    count rather than treating it as a source that stayed quiet.
+    """
     api_key = os.environ.get("ELEMENT14_API_KEY")
     if not api_key:
-        return None
+        raise SourceUnavailable("element14: no API key")
+
+    store = store or os.environ.get("ELEMENT14_STORE") or "www.newark.com"
+    # Built by hand rather than with urlencode: the documented samples put
+    # callInfo.apiKey last and include an empty refinements.filters, and this
+    # is the shape that answers 200.
+    qs = (
+        "term=manuPartNum%%3A%s"
+        "&storeInfo.id=%s"
+        "&resultsSettings.offset=0"
+        "&resultsSettings.numberOfResults=2"
+        "&resultsSettings.refinements.filters="
+        "&resultsSettings.responseGroup=inventory"
+        "&callInfo.responseDataFormat=JSON"
+        "&callInfo.apiKey=%s"
+    ) % (urllib.parse.quote(mpn), store, urllib.parse.quote(api_key))
 
     try:
-        params = urllib.parse.urlencode({
-            "callInfo.apiKey": api_key,
-            "term": f"manuPartNum:{mpn}",
-            "storeInfo.id": "us.newark.com",
-            "resultsSettings.offset": 0,
-            "resultsSettings.numberOfResults": 3,
-            "resultsSettings.responseGroup": "medium",
-        })
-        url = f"https://api.element14.com/catalog/products?{params}"
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        req = urllib.request.Request("https://api.element14.com/catalog/products?" + qs,
+                                     headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
-    except (urllib.error.URLError, OSError, json.JSONDecodeError):
-        return None
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        raise SourceUnavailable("element14: %s" % exc) from exc
 
-    products = data.get("manufacturerPartNumberSearchReturn", {}).get("products", [])
+    products = (data.get("manufacturerPartNumberSearchReturn", {})
+                    .get("products") or [])
     for product in products:
-        result = {}
-        for attr in product.get("attributes", []):
-            label = attr.get("attributeLabel", "").lower()
+        result: dict = {"provides_status": False}
+        fulfilment = product.get("productStatus")
+        if fulfilment:
+            result["fulfilment"] = fulfilment
+        if product.get("sku"):
+            result["sku"] = product["sku"]
+        if product.get("isAwaitingRelease") is not None:
+            result["awaiting_release"] = bool(product["isAwaitingRelease"])
+        for attr in product.get("attributes") or []:
+            label = (attr.get("attributeLabel") or "").lower()
             value = attr.get("attributeValue", "")
-            if "lifecycle" in label or "status" in label:
-                result["status"] = value
-            elif "operating temperature" in label and value:
+            if "operating temperature" in label and value:
                 temp = _parse_temp_range(value)
                 if temp:
                     result["temp_min_c"] = temp[0]
                     result["temp_max_c"] = temp[1]
                     result["temp_raw"] = value
-        if result:
-            return result
+        return result
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Nexar / Octopart
+# ---------------------------------------------------------------------------
+
+def _get_nexar_token() -> str | None:
+    """A Nexar bearer token from the client-credentials pair.
+
+    No redirect and no browser, so the callback URL the portal insists on at
+    app creation is never exercised by this flow. A static NEXAR_ACCESS_TOKEN
+    is honoured if that is all there is, but it expires in a day, so the
+    credentials are preferred and the minted token is cached like DigiKey's.
+    """
+    cid = os.environ.get("NEXAR_CLIENT_ID")
+    secret = os.environ.get("NEXAR_CLIENT_SECRET")
+    if not (cid and secret):
+        return os.environ.get("NEXAR_ACCESS_TOKEN") or None
+
+    cache_path = os.path.join(tempfile.gettempdir(), "nexar_token_cache.json")
+    try:
+        with open(cache_path) as fh:
+            cached = json.load(fh)
+        if cached.get("expires_at", 0) > time.time() + 60:
+            return cached["access_token"]
+    except (OSError, ValueError, KeyError):
+        pass
+
+    body = urllib.parse.urlencode({
+        "grant_type": "client_credentials",
+        "client_id": cid, "client_secret": secret,
+        "scope": "supply.domain",
+    }).encode()
+    try:
+        req = urllib.request.Request(
+            "https://identity.nexar.com/connect/token", data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            tok = json.loads(resp.read())
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, KeyError):
+        return None
+
+    try:
+        with open(cache_path, "w") as fh:
+            json.dump({"access_token": tok["access_token"],
+                       "expires_at": time.time() + int(tok.get("expires_in", 3600))}, fh)
+    except OSError:
+        pass
+    return tok.get("access_token")
+
+
+_NEXAR_QUERY = """
+query ($q: String!) {
+  supSearchMpn(q: $q, limit: 1) {
+    results {
+      part {
+        mpn
+        manufacturer { name }
+        totalAvail
+        estimatedFactoryLeadDays
+        specs { attribute { shortname } value displayValue }
+      }
+    }
+  }
+}"""
+
+
+def query_lifecycle_nexar(mpn: str, timeout: float = 10.0) -> dict | None:
+    """Query Nexar for lifecycle, availability and temperature.
+
+    Deliberately not in the default source set. An evaluation licence carries
+    a hard lifetime cap on part lookups — a hundred, on the one this was built
+    against — so a source that silently ran on every pipeline invocation would
+    spend the whole allowance during a single afternoon's design iteration.
+    It runs when asked for and not otherwise, and the cache means asking twice
+    for the same part costs one lookup.
+
+    Lifecycle arrives as a spec rather than a field: attribute shortname
+    ``lifecyclestatus``, with values like "Production (Last Updated: 2 weeks
+    ago)".
+    """
+    token = _get_nexar_token()
+    if not token:
+        raise SourceUnavailable("nexar: no credentials, or no token issued")
+    try:
+        req = urllib.request.Request(
+            "https://api.nexar.com/graphql",
+            data=json.dumps({"query": _NEXAR_QUERY, "variables": {"q": mpn}}).encode(),
+            headers={"Content-Type": "application/json",
+                     "Authorization": "Bearer " + token})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        raise SourceUnavailable("nexar: %s" % exc) from exc
+    if data.get("errors"):
+        raise SourceUnavailable("nexar: %s" % data["errors"])
+
+    results = (((data.get("data") or {}).get("supSearchMpn") or {})
+               .get("results") or [])
+    for entry in results:
+        part = entry.get("part") or {}
+        got = (part.get("mpn") or "").upper()
+        if got and not got.startswith(mpn.upper()[:6]):
+            continue
+        result: dict = {}
+        for spec in part.get("specs") or []:
+            short = ((spec.get("attribute") or {}).get("shortname") or "").lower()
+            value = spec.get("displayValue") or spec.get("value")
+            if short == "lifecyclestatus" and value:
+                result["status"] = value
+            elif "operating" in short and "temp" in short and value:
+                temp = _parse_temp_range(str(value))
+                if temp:
+                    result["temp_min_c"] = temp[0]
+                    result["temp_max_c"] = temp[1]
+                    result["temp_raw"] = value
+        avail = part.get("totalAvail")
+        if avail is not None:
+            result["in_stock"] = avail > 0
+            result["stock_qty"] = avail
+        lead = part.get("estimatedFactoryLeadDays")
+        if lead is not None:
+            result["lead_time_days"] = lead
+        if part.get("manufacturer"):
+            result["manufacturer"] = (part["manufacturer"] or {}).get("name")
+        if not result.get("status"):
+            result["provides_status"] = False
+        return result or None
     return None
 
 
@@ -428,17 +642,197 @@ def read_extraction_temperature(mpn: str, project_dir: str) -> dict | None:
 # Per-component audit
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Concurrency, timing and confidence
+# ---------------------------------------------------------------------------
+
+from concurrent.futures import ThreadPoolExecutor as _ThreadPool  # noqa: E402
+from concurrent.futures import as_completed as _as_completed  # noqa: E402
+
+try:  # the cache module sits beside this one; keep working if it is absent
+    from lifecycle_cache import (  # noqa: E402
+        LifecycleCache as _LifecycleCache,
+        SourceScheduler as _SourceScheduler,
+        score as _score,
+        RateLimiter as _RateLimiter,
+        compute as _compute,
+        mpn_key as _mpn_key,
+        DEFAULT_TTL_DAYS as _DEFAULT_TTL_DAYS,
+    )
+    import lifecycle_table as _table
+except ImportError:  # pragma: no cover
+    try:
+        from .lifecycle_cache import (  # type: ignore
+            LifecycleCache as _LifecycleCache,
+            SourceScheduler as _SourceScheduler,
+            score as _score,
+            RateLimiter as _RateLimiter,
+            compute as _compute,
+            mpn_key as _mpn_key,
+            DEFAULT_TTL_DAYS as _DEFAULT_TTL_DAYS,
+        )
+        from . import lifecycle_table as _table  # type: ignore
+    except Exception:
+        _LifecycleCache = None  # type: ignore
+        _SourceScheduler = None  # type: ignore
+        _score = None  # type: ignore
+        _RateLimiter = None  # type: ignore
+        _compute = None  # type: ignore
+        _table = None  # type: ignore
+        _DEFAULT_TTL_DAYS = 45
+
+        def _mpn_key(mpn: str) -> str:  # type: ignore[misc]
+            return mpn.strip().upper()
+
+
+def _default_table_path(project_dir: str | None) -> str | None:
+    """Where the project's lifecycle table lives.
+
+    Beside the design documents rather than in the analysis directory: it is
+    something a person edits and reviews in a diff, not an artefact a run
+    produces and discards.
+    """
+    if not project_dir:
+        return None
+    root = os.path.abspath(project_dir)
+    # The schematic sits in .pipeline/; the design files are its parent.
+    if os.path.basename(root) == ".pipeline":
+        root = os.path.dirname(root)
+    return os.path.join(root, "lifecycle.md")
+
+
+def _default_cache_path(project_dir: str | None) -> str:
+    """Where the lifecycle cache lives.
+
+    Beside the project when there is one, so it travels with the design and a
+    teammate's checkout starts warm; otherwise in the user cache directory.
+    """
+    if project_dir:
+        return os.path.join(os.path.abspath(project_dir), "analysis",
+                            "lifecycle_cache.json")
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(base, "kicad-happy", "lifecycle_cache.json")
+
+
+_API_FNS = {
+    "lcsc": query_lifecycle_lcsc,
+    "digikey": query_lifecycle_digikey,
+    "element14": query_lifecycle_element14,
+    "mouser": query_lifecycle_mouser,
+    "nexar": query_lifecycle_nexar,
+}
+
+# Queried unless the caller narrows the set. Nexar is absent on purpose: the
+# evaluation licence it was built against allows a hundred part lookups for
+# the life of the key, and this pipeline gets run dozens of times a day.
+DEFAULT_SOURCES = ["lcsc", "digikey", "element14", "mouser"]
+
+# Which sources can actually return a lifecycle status, as opposed to stock or
+# fulfilment. The confidence ceiling is set from this, not from how many
+# distributors were contacted.
+STATUS_CAPABLE = {"digikey", "nexar"}
+
+# Which sources can return an operating-temperature range - every one of them
+# parses it. Kept separate from STATUS_CAPABLE because lifecycle and
+# temperature finish at different times: the confidence exit settles the
+# first, and only a datasheet extraction settles the second.
+TEMPERATURE_CAPABLE = {"digikey", "mouser", "lcsc", "element14", "nexar"}
+
+
+def parse_sources(text: str) -> list[str]:
+    """A comma-separated source list from the command line, checked.
+
+    Names are trimmed, and one that is not a known source is an error: a
+    stray space or a typo used to match nothing and be dropped in silence,
+    leaving a run with fewer sources than asked for - or none.
+    """
+    names = [s.strip().lower() for s in text.split(",") if s.strip()]
+    unknown = [s for s in names if s not in _API_FNS]
+    if unknown:
+        raise ValueError("unknown source%s %s (known: %s)"
+                         % ("" if len(unknown) == 1 else "s", ", ".join(unknown),
+                            ", ".join(_API_FNS)))
+    return names
+
+
+def run_sources(sources: list[str] | None = None) -> list[str]:
+    """The sources a run asks: the ones named, or the default set."""
+    return [s for s in _API_FNS
+            if (s in sources if sources else s in DEFAULT_SOURCES)]
+
+
+def status_capable_count(sources: list[str] | None = None) -> int:
+    """How many of a run's sources can return a lifecycle status at all.
+
+    The computed score's ceiling is set from this, so anything rescoring an
+    audit's answers has to count the same way or it cannot reproduce them.
+    """
+    return len([s for s in run_sources(sources) if s in STATUS_CAPABLE])
+
+
+def _timed_query(fn, mpn: str, timeout: float, source: str = "",
+                 limiter=None):
+    """Run one distributor query, reporting how long it took and whether it worked.
+
+    The distinction matters to the scheduler: a source that answers "no such
+    part" in 300 ms is healthy and should keep its place near the front, while
+    one that raises after its full deadline should be pushed back and given a
+    longer rope next time. Both return no data, so elapsed time is the only
+    thing that separates them.
+
+    A third outcome is neither: the source refusing us because we asked too
+    fast. That must not be recorded as slowness, because the cure is waiting
+    longer between calls rather than waiting longer for an answer. Nor is it
+    a latency, and neither is a missing key: both come back with ``ok=None``,
+    meaning "record no timing at all". A credential check that returns in
+    microseconds, recorded as a successful answer, gave a source a near-zero
+    latency and with it the two-second floor once the key was added.
+
+    The fourth value says whether the source actually answered, which is what
+    decides whether the result may be cached. Only an answer can be: a None
+    from a source that was never reached is not "this part is not carried".
+    """
+    if limiter is not None and source:
+        limiter.acquire(source)
+    started = time.time()
+    try:
+        data = fn(mpn, timeout=timeout)
+        return data, time.time() - started, True, True
+    except Exception as exc:
+        # The query functions wrap the transport error; the rate limiter has
+        # to see the HTTP status underneath it.
+        cause = exc.__cause__ if isinstance(exc, SourceUnavailable) else exc
+        if (limiter is not None and source and cause is not None
+                and limiter.is_rejection(cause)):
+            limiter.penalise(source)
+            return None, time.time() - started, None, False
+        if isinstance(exc, SourceUnavailable):
+            # A transport failure counts against the source's timing; a
+            # missing key is no observation at all, since nothing was asked.
+            return None, time.time() - started, (False if cause is not None else None), False
+        if isinstance(exc, (urllib.error.URLError, OSError, json.JSONDecodeError,
+                            KeyError, ValueError, TypeError)):
+            return None, time.time() - started, False, False
+        raise
+
+
 def audit_component(mpn: str, sources: list[str], project_dir: str | None = None,
-                    delay: float = 1.0) -> dict:
-    """Query all available sources for one component's lifecycle + temperature."""
+                    delay: float = 0.0, cache=None, scheduler=None,
+                    confidence_exit: float = 0.90, limiter=None) -> dict:
+    """Query the available sources for one component's lifecycle + temperature.
+
+    Cache first, then whatever is left, concurrently. Pacing is the
+    ``limiter``'s job: --delay reaches it as a floor under each source's
+    interval, so calls to one source are spaced by at least that many seconds
+    while different sources still run together. ``delay`` itself is accepted
+    for callers that still pass it and is not used here.
+    """
     result = {"mpn": mpn, "sources": {}}
-    # Worst-case status across sources (drives the default finding severity).
-    best_status = "unknown"
-    # Track every source's normalized status so callers can detect disagreement
-    # (e.g., DigiKey=active, Mouser=obsolete — severity should be WARNING, not
-    # ERROR, because the part is still orderable from one distributor).
     per_source_status: dict[str, str] = {}
     temp_data = None
+    source_ranges: dict[str, tuple[float, float]] = {}
+
+    wanted = run_sources(sources)
 
     # Try extraction cache first (no network, no delay)
     if project_dir:
@@ -446,49 +840,99 @@ def audit_component(mpn: str, sources: list[str], project_dir: str | None = None
         if ext_temp:
             temp_data = ext_temp
 
-    # Query distributor APIs
-    api_fns = {
-        "lcsc": query_lifecycle_lcsc,
-        "digikey": query_lifecycle_digikey,
-        "element14": query_lifecycle_element14,
-        "mouser": query_lifecycle_mouser,
-    }
+    def absorb(source_name: str, data: dict | None) -> None:
+        if not data:
+            return
+        result["sources"][source_name] = data
+        raw_status = data.get("status")
+        if raw_status:
+            per_source_status[source_name] = _normalize_status(raw_status)
+        if data.get("temp_min_c") is not None and data.get("temp_max_c") is not None:
+            source_ranges[source_name] = (data["temp_min_c"], data["temp_max_c"])
 
-    for source_name, fn in api_fns.items():
-        if sources and source_name not in sources:
-            continue
-        try:
-            time.sleep(delay)
-            data = fn(mpn)
-            if data:
-                result["sources"][source_name] = data
-                # Update best status
-                raw_status = data.get("status")
-                if raw_status:
-                    normalized = _normalize_status(raw_status)
-                    per_source_status[source_name] = normalized
-                    if normalized != "unknown":
-                        best_status = normalized
-                # Update temperature if not already from extraction
-                if not temp_data and data.get("temp_min_c") is not None:
-                    temp_data = {
-                        "temp_min_c": data["temp_min_c"],
-                        "temp_max_c": data["temp_max_c"],
-                        "source": f"api:{source_name}",
-                    }
-        except (urllib.error.URLError, OSError, json.JSONDecodeError,
-                KeyError, ValueError, TypeError):
-            continue
+    # Source zero. A cached answer costs nothing and is the reason a re-run
+    # during a design session should not touch the network at all.
+    remaining = list(wanted)
+    cache_hits = 0
+    if cache is not None:
+        for source_name, data in cache.covered(mpn, wanted).items():
+            absorb(source_name, data)
+            cache_hits += 1
+            if source_name in remaining:
+                remaining.remove(source_name)
 
-    result["status"] = best_status
-    # Consensus: True when distributors disagree and at least one says active.
-    # A part reported obsolete by one distributor but active by another is
-    # still orderable, so the finding should be warning rather than error.
+    if remaining and _score is not None:
+        early = _score(per_source_status)
+        if early["confidence"] >= confidence_exit:
+            # Enough agreement on lifecycle already; the rest of the sources
+            # would only confirm it, and confirmation is the expensive part.
+            # But that settles lifecycle, not temperature: the ranges are
+            # intersected, so any source still unasked may carry the only
+            # range or a narrower one, and skipping it made LT-001 depend on
+            # cache coverage. Only a datasheet extraction, which outranks
+            # every distributor's range, lets those sources go too.
+            remaining = [s for s in remaining
+                         if s in TEMPERATURE_CAPABLE and temp_data is None]
+
+    if remaining:
+        order = scheduler.order() if scheduler is not None else remaining
+        ordered = [s for s in order if s in remaining]
+        budgets = {s: (scheduler.budget(s) if scheduler is not None else 10.0)
+                   for s in ordered}
+        with _ThreadPool(max_workers=max(1, len(ordered))) as pool:
+            futures = {}
+            for source_name in ordered:
+                fn = _API_FNS[source_name]
+                futures[pool.submit(_timed_query, fn, mpn, budgets[source_name],
+                                    source_name, limiter)] = source_name
+            for fut in _as_completed(futures):
+                source_name = futures[fut]
+                try:
+                    data, elapsed, ok, answered = fut.result()
+                except Exception:
+                    data, elapsed, ok, answered = None, budgets[source_name], False, False
+                if cache is not None:
+                    if ok is not None:
+                        cache.observe(source_name, elapsed, ok)
+                    if answered:
+                        cache.put(mpn, source_name, data)
+                absorb(source_name, data)
+
+    # The worst status any source reports, as score() decides it. Taking the
+    # last one absorbed made the answer depend on which request happened to
+    # finish last, so a part DigiKey and Nexar disagree on flipped between
+    # active and obsolete from run to run.
+    if _score is not None:
+        result["status"] = _score(per_source_status)["status"]
+    else:
+        result["status"] = next((per_source_status[s] for s in sorted(per_source_status)
+                                 if per_source_status[s] != "unknown"), "unknown")
     _non_active = {"obsolete", "discontinued", "last_time_buy", "nrnd"}
     has_active = any(s == "active" for s in per_source_status.values())
     has_non_active = any(s in _non_active for s in per_source_status.values())
     result["consensus_split"] = has_active and has_non_active
+    # Distributor ranges are combined only after every answer is in, by the
+    # conservative rule: the highest minimum and the lowest maximum any source
+    # states, i.e. the range all of them agree the part covers. Taking the
+    # first range to arrive made pass/fail depend on which request was faster,
+    # and on whether the run was fetched or served from the cache. A fixed
+    # source precedence would be stable too, but would still pass a design on
+    # one distributor's word while another rates the part narrower - and
+    # telling someone a part covers a range it may not is the expensive error.
+    # Ranges that do not overlap at all leave the minimum above the maximum,
+    # which fails any design range - right for data that contradicts itself.
+    # A datasheet extraction, read first above, still outranks all of them.
+    if not temp_data and source_ranges:
+        temp_data = {
+            "temp_min_c": max(lo for lo, _ in source_ranges.values()),
+            "temp_max_c": min(hi for _, hi in source_ranges.values()),
+            "source": "api:" + "+".join(sorted(source_ranges)),
+            "ranges": {s: list(r) for s, r in sorted(source_ranges.items())},
+        }
     result["per_source_status"] = per_source_status
+    result["cache_hits"] = cache_hits
+    if _score is not None:
+        result["confidence"] = _score(per_source_status)
     if temp_data:
         result["temperature"] = temp_data
     return result
@@ -496,14 +940,27 @@ def audit_component(mpn: str, sources: list[str], project_dir: str | None = None
 
 def find_alternatives(mpn: str,
                       sources: list[str] | None = None,
-                      delay: float = 1.0) -> list[dict]:
+                      delay: float = 0.0,
+                      timeout: float = 10.0,
+                      limiter=None) -> list[dict]:
     """Search for active alternative parts when a component is EOL/NRND/obsolete.
 
     Checks Mouser's SuggestedReplacement field first, then searches DigiKey
-    and LCSC for parts with similar descriptions.
+    and LCSC for parts with similar descriptions. ``timeout`` is the deadline
+    for each request, matching the query functions' default.
+
+    Requests are paced by ``limiter`` - the audit's per-source limiter, which
+    carries --delay - so these calls and the lifecycle queries share one
+    spacing per source. Without one, ``delay`` seconds are slept before each.
 
     Returns list of alternatives with mpn, manufacturer, source, status.
     """
+    def pace(source: str) -> None:
+        if limiter is not None:
+            limiter.acquire(source)
+        elif delay > 0:
+            time.sleep(delay)
+
     alternatives = []
     seen_mpns = {mpn.upper()}  # Don't suggest the original part
 
@@ -512,7 +969,7 @@ def find_alternatives(mpn: str,
         api_key = os.environ.get("MOUSER_SEARCH_API_KEY") or os.environ.get("MOUSER_PART_API_KEY")
         if api_key:
             try:
-                time.sleep(delay)
+                pace("mouser")
                 body = json.dumps({
                     "SearchByPartRequest": {
                         "mouserPartNumber": mpn,
@@ -522,7 +979,7 @@ def find_alternatives(mpn: str,
                 url = f"https://api.mouser.com/api/v1/search/partnumber?apiKey={api_key}"
                 req = urllib.request.Request(url, data=body,
                                             headers={"Content-Type": "application/json"})
-                with urllib.request.urlopen(req, timeout=10) as resp:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
                     data = json.loads(resp.read())
                 for part in data.get("SearchResults", {}).get("Parts", []):
                     repl = part.get("SuggestedReplacement")
@@ -546,7 +1003,7 @@ def find_alternatives(mpn: str,
             base_mpn = re.sub(r'[A-Z]{0,3}$', '', mpn)  # Strip trailing package codes
             if len(base_mpn) >= 4:
                 try:
-                    time.sleep(delay)
+                    pace("digikey")
                     body = json.dumps({"Keywords": base_mpn, "Limit": 5}).encode()
                     req = urllib.request.Request(
                         "https://api.digikey.com/products/v4/search/keyword",
@@ -557,7 +1014,7 @@ def find_alternatives(mpn: str,
                             "Content-Type": "application/json",
                         },
                     )
-                    with urllib.request.urlopen(req, timeout=10) as resp:
+                    with urllib.request.urlopen(req, timeout=timeout) as resp:
                         data = json.loads(resp.read())
                     for product in data.get("Products", []):
                         prod_mpn = product.get("ManufacturerProductNumber", "")
@@ -584,10 +1041,10 @@ def find_alternatives(mpn: str,
         base_mpn = re.sub(r'[A-Z]{0,3}$', '', mpn)
         if len(base_mpn) >= 4:
             try:
-                time.sleep(delay)
+                pace("lcsc")
                 url = f"https://jlcsearch.tscircuit.com/api/search?q={urllib.parse.quote(base_mpn)}&limit=5&full=true"
                 req = urllib.request.Request(url, headers={"User-Agent": "kicad-happy-lifecycle/1.0"})
-                with urllib.request.urlopen(req, timeout=10) as resp:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
                     data = json.loads(resp.read())
                 for comp in data.get("components", []):
                     extra = comp.get("extra", {})
@@ -619,13 +1076,41 @@ def find_alternatives(mpn: str,
 def audit_bom(analysis_json: dict, project_dir: str | None = None,
               temp_range: tuple[float, float] | None = None,
               sources: list[str] | None = None,
-              delay: float = 1.0,
-              suggest_alternatives: bool = False) -> dict:
-    """Audit all components in the BOM for lifecycle and temperature."""
+              delay: float = 0.0,
+              suggest_alternatives: bool = False,
+              cache_path: str | None = None,
+              ttl_days: float | None = None,
+              use_cache: bool = True,
+              concurrency: int = 8,
+              confidence_exit: float = 0.90,
+              report_threshold: float = 0.80,
+              table_path: str | None = None,
+              progress=None) -> dict:
+    """Audit all components in the BOM for lifecycle and temperature.
+
+    Parts are fetched concurrently and cached between runs. ``progress``, when
+    given, is called with a dict after each part so a caller can drive a bar;
+    the fraction it reports is of parts *settled* — resolved to at least
+    ``report_threshold`` confidence — rather than merely attempted, because a
+    part that came back unknown from every source has not been audited in any
+    sense a reviewer would accept.
+
+    ``delay`` is the minimum spacing, in seconds, between consecutive requests
+    to the same source (lifecycle queries and alternatives searches alike);
+    different sources are still asked concurrently. Zero, the default, adds
+    no waiting beyond each source's own learned rate limit.
+
+    ``use_cache=False`` neither reads nor writes the cache. A zero TTL is not
+    the same thing: it only makes old entries stale, and the run still writes
+    every answer it fetched back to disk.
+    """
     bom = analysis_json.get("bom", [])
 
     # Extract unique MPNs
     mpn_map = {}  # mpn -> list of references
+    # One part however the BOM capitalises it, as the cache and table see it;
+    # the first spelling met is the one reported.
+    spelling: dict[str, str] = {}
     skipped = 0
     for entry in bom:
         if entry.get("dnp"):
@@ -636,6 +1121,7 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
         if not _is_real_mpn(mpn):
             skipped += 1
             continue
+        mpn = spelling.setdefault(_mpn_key(mpn), mpn)
         mpn_map.setdefault(mpn, []).extend(entry.get("references", []))
 
     lifecycle_findings = []
@@ -647,12 +1133,134 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
     temp_fail = 0
 
     total = len(mpn_map)
-    for i, (mpn, refs) in enumerate(sorted(mpn_map.items())):
-        print(f"[{i+1}/{total}] {mpn}", file=sys.stderr)
-        data = audit_component(mpn, sources or [], project_dir, delay)
 
-        # Lifecycle
-        status = data.get("status", "unknown")
+    # Cache and scheduler are shared across the whole run: one read at the
+    # start, one write at the end, and the timing each part observes informs
+    # the sources the next part asks first.
+    cache = None
+    scheduler = None
+    asked = run_sources(sources)
+    if _LifecycleCache is not None and use_cache:
+        path = cache_path or _default_cache_path(project_dir)
+        cache = _LifecycleCache(path, ttl_days if ttl_days is not None else _DEFAULT_TTL_DAYS)
+        # Recorded so lifecycle_recalc can rescore against the same set.
+        cache.sources = asked
+        scheduler = _SourceScheduler(cache, asked)
+    # --delay is a floor under each source's own interval: consecutive calls to
+    # one source are spaced by at least that much, different sources still run
+    # together, and the default of zero adds no waiting.
+    limiter = (_RateLimiter(cache, min_interval=delay)
+               if _RateLimiter is not None else None)
+
+    ordered_mpns = sorted(mpn_map.items())
+    settled = 0
+    results: dict[str, dict] = {}
+
+    # The computed score is what "80% confident" means to a reader: the raw
+    # agreement score is normalised against what was achievable, and where
+    # DigiKey is the only status-capable source it cannot exceed 0.55 however
+    # certain the answer is. Scoring against raw made `settled` structurally
+    # zero and the progress fraction with it, so the context the score needs
+    # is gathered here rather than after the loop.
+    table_path_resolved = table_path or _default_table_path(project_dir)
+    scoring = _table is not None and _compute is not None
+    existing_rows = (_table.read_table(table_path_resolved)
+                     if scoring and table_path_resolved else {})
+    existing_by_key = _table.by_mpn_key(existing_rows) if existing_rows else {}
+    api_capable = status_capable_count(sources)
+
+    def _score(mpn, data):
+        """The 0-100 score for one part, or None when scoring is unavailable."""
+        if not scoring:
+            return None
+        user = (_table.user_row(existing_by_key.get(_mpn_key(mpn), {}))
+                if existing_rows else None)
+        scored = _compute(data.get("per_source_status") or {}, api_capable, user)
+        data["computed_confidence"] = scored
+        return scored
+    if cache is not None and scheduler is not None:
+        cached_fully = sum(
+            1 for mpn, _ in ordered_mpns
+            if len(cache.covered(mpn, scheduler.sources, count=False)) == len(scheduler.sources)
+        )
+        est = scheduler.estimate(total, concurrency, cached_fully)
+        print("lifecycle: %d parts, %d fully cached, estimate %.0fs at %d workers (%s)"
+              % (total, cached_fully, est["seconds"], concurrency, est["basis"]),
+              file=sys.stderr)
+
+    def _one(item):
+        mpn, refs = item
+        return mpn, audit_component(mpn, sources or [], project_dir, delay,
+                                    cache=cache, scheduler=scheduler,
+                                    confidence_exit=confidence_exit,
+                                    limiter=limiter)
+
+    with _ThreadPool(max_workers=max(1, concurrency)) as pool:
+        for done, (mpn, data) in enumerate(pool.map(_one, ordered_mpns), start=1):
+            results[mpn] = data
+            raw = (data.get("confidence") or {}).get("confidence", 0.0)
+            scored = _score(mpn, data)
+            # report_threshold is a fraction; the computed score is out of 100.
+            conf = scored["computed"] if scored else raw * 100.0
+            if conf >= report_threshold * 100.0:
+                settled += 1
+            if progress is not None:
+                progress({"done": done, "total": total, "settled": settled,
+                          "fraction_settled": settled / total if total else 1.0,
+                          "mpn": mpn, "confidence": conf, "raw": raw})
+            print("[%d/%d] %s  conf=%.0f (raw %.2f)" % (done, total, mpn, conf, raw),
+                  file=sys.stderr)
+
+    # Fold in whatever a human already wrote into the project's table, score
+    # each part against what was actually achievable, and write the script
+    # columns back without touching theirs.
+    table_summary = None
+    if scoring:
+        path = table_path_resolved
+        findings_for_table: dict[str, dict] = {}
+        for mpn, data in results.items():
+            # Already scored in the loop above; _score is idempotent.
+            scored = data.get("computed_confidence") or _score(mpn, data)
+            findings_for_table[mpn] = {
+                "refs": sorted(mpn_map.get(mpn, []))[:6],
+                "status": scored.get("status", data.get("status", "unknown")),
+                "computed": scored.get("computed"),
+                "raw": scored.get("raw"),
+                "responding": scored.get("responding"),
+                "capable": scored.get("capable"),
+                "needs_ack": scored.get("needs_ack"),
+            }
+        if path:
+            try:
+                table_summary = _table.write_table(path, findings_for_table)
+                print("lifecycle: table %s — %d rows, %d carrying human input, "
+                      "%d awaiting acknowledgement"
+                      % (path, table_summary["rows"],
+                         table_summary["with_user_data"],
+                         len(table_summary["awaiting_acknowledgement"])),
+                      file=sys.stderr)
+            except OSError as exc:
+                print("lifecycle: table not written (%s)" % exc, file=sys.stderr)
+
+    if cache is not None:
+        try:
+            cache.save()
+        except OSError as exc:
+            print("lifecycle: cache not written (%s)" % exc, file=sys.stderr)
+        print("lifecycle: cache %s; %d/%d parts settled at >=%.0f%% confidence"
+              % (cache.stats, settled, total, report_threshold * 100), file=sys.stderr)
+
+    for i, (mpn, refs) in enumerate(ordered_mpns):
+        data = results[mpn]
+
+        # Lifecycle. The finding reports the same decision the table does:
+        # the computed status, with a referenced human check folded in. Using
+        # the API-only status here let a report say LC-ACT/active about a part
+        # the table had marked obsolete and awaiting acknowledgement.
+        scored = data.get("computed_confidence")
+        status = (scored or {}).get("status") or data.get("status", "unknown")
+        per_source = ((scored or {}).get("statuses")
+                      or data.get('per_source_status', {}))
         status_counts[status] = status_counts.get(status, 0) + 1
 
         finding = {
@@ -661,6 +1269,13 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
             "status": status,
             "sources": data.get("sources", {}),
         }
+        if scored:
+            prior = existing_by_key.get(_mpn_key(mpn), {})
+            finding["computed_confidence"] = scored.get("computed")
+            # Outstanding, as the table's Ack? column means it: warranted and
+            # not yet signed for.
+            finding["needs_ack"] = bool(scored.get("needs_ack")
+                                        and not (prior.get("Acknowledged") or "").strip())
 
         # Flag non-active statuses
         if status in ("nrnd", "last_time_buy", "obsolete", "discontinued"):
@@ -680,15 +1295,17 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
             # Search for alternatives if requested
             if suggest_alternatives:
                 print(f"  Searching for alternatives...", file=sys.stderr)
-                alts = find_alternatives(mpn, sources, delay)
+                alts = find_alternatives(mpn, sources, delay, limiter=limiter)
                 if alts:
                     finding["alternatives"] = alts
 
         rule_info = _LIFECYCLE_STATUS_RULES.get(status)
         if rule_info:
             rule_id, severity = rule_info
-            consensus_split = data.get('consensus_split', False)
-            per_source = data.get('per_source_status', {})
+            consensus_split = (any(s == 'active' for s in per_source.values())
+                               and any(s in ('obsolete', 'discontinued',
+                                             'last_time_buy', 'nrnd')
+                                       for s in per_source.values()))
             # Demote ERROR → WARNING when distributors disagree. The part is
             # still orderable from at least one active source, so "obsolete"
             # overstates the supply risk.
@@ -778,6 +1395,15 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
                         weeks = int(m.group(1))
                         if 'day' in lt.lower():
                             weeks = weeks // 7
+                if weeks > max_lead_weeks:
+                    max_lead_weeks = weeks
+                    lead_source = src_name
+            # Nexar gives a day count under its own key rather than Mouser's
+            # week string, so it never reached the comparison above. Whole
+            # weeks, rounding down, as for a Mouser value quoted in days.
+            days = src_data.get('lead_time_days')
+            if isinstance(days, (int, float)) and days > 0:
+                weeks = int(days) // 7
                 if weeks > max_lead_weeks:
                     max_lead_weeks = weeks
                     lead_source = src_name
@@ -928,6 +1554,22 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
 # CLI
 # ---------------------------------------------------------------------------
 
+def project_dir_from_analysis(analysis: dict, input_path: Path) -> str:
+    """The project an analyzer JSON describes: where its schematic lives.
+
+    The current envelope records the schematic under inputs.source_files and
+    has dropped the legacy top-level ``file``. Falling back to the JSON's own
+    directory put the cache and the lifecycle table inside a timestamped
+    analysis run, so every run started cold and wrote its own table, and the
+    one a person had edited was never read. Legacy JSON still works.
+    """
+    sources = ((analysis.get("inputs") or {}).get("source_files") or [])
+    schematic = sources[0] if sources else analysis.get("file", "")
+    if schematic:
+        return str(Path(schematic).resolve().parent)
+    return str(input_path.parent)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Component lifecycle and temperature audit",
@@ -958,8 +1600,52 @@ def main():
         help="Query only specific sources (comma-separated: digikey,mouser,lcsc,element14)",
     )
     parser.add_argument(
-        "--delay", type=float, default=1.0,
-        help="Seconds between API calls (default: 1.0)",
+        "--nexar", action="store_true",
+        help="Also query Nexar. OFF by default: an evaluation licence caps "
+             "part lookups for the life of the key, so this must be asked for",
+    )
+    parser.add_argument(
+        "--cache", dest="cache_path", default=None,
+        help="Lifecycle cache file (default: <project>/analysis/lifecycle_cache.json)",
+    )
+    parser.add_argument(
+        "--project", default=None,
+        help="Project directory, for the default cache and table locations "
+             "(default: the directory of the schematic the JSON was built from)",
+    )
+    parser.add_argument(
+        "--table", dest="table_path", default=None,
+        help="Lifecycle table file (default: <project>/lifecycle.md)",
+    )
+    parser.add_argument(
+        "--ttl-days", type=float, default=None,
+        help="How long a cached distributor answer stays fresh (default: %d)" % _DEFAULT_TTL_DAYS,
+    )
+    parser.add_argument(
+        "--no-cache", action="store_true",
+        help="Ignore and do not write the lifecycle cache",
+    )
+    parser.add_argument(
+        "--concurrency", type=int, default=8,
+        help="Parts fetched at once (default: 8)",
+    )
+    parser.add_argument(
+        "--confidence-exit", type=float, default=0.90,
+        help="Stop asking for a part's lifecycle once confidence reaches this "
+             "(default: 0.90). Sources that can still supply an operating-"
+             "temperature range are asked regardless, unless a datasheet "
+             "extraction already gives one",
+    )
+    parser.add_argument(
+        "--report-threshold", type=float, default=0.80,
+        help="Confidence at which a part counts as settled (default: 0.80)",
+    )
+    parser.add_argument(
+        "--delay", type=float, default=0.0,
+        help="Minimum seconds between consecutive requests to the same source "
+             "(default: 0, no added waiting). Different sources are still "
+             "queried concurrently; a source's own learned rate limit applies "
+             "when it is longer",
     )
     parser.add_argument(
         "--suggest-alternatives", action="store_true",
@@ -982,9 +1668,7 @@ def main():
     with open(input_path) as f:
         analysis = json.load(f)
 
-    # Resolve project directory from analyzer JSON
-    source_file = analysis.get("file", "")
-    project_dir = str(Path(source_file).parent) if source_file else str(input_path.parent)
+    project_dir = args.project or project_dir_from_analysis(analysis, input_path)
 
     # Parse temperature range
     temp_range = None
@@ -1005,12 +1689,26 @@ def main():
                       f"Presets: {', '.join(_TEMP_PRESETS.keys())}", file=sys.stderr)
                 sys.exit(1)
 
-    # Parse sources
-    sources = args.only.split(",") if args.only else []
+    # Parse sources. --nexar adds Nexar to whatever set is in force, the
+    # explicit one included: letting a non-empty --only win silently dropped it.
+    try:
+        sources = parse_sources(args.only) if args.only else list(DEFAULT_SOURCES)
+    except ValueError as exc:
+        parser.error("--only: %s" % exc)
+    if getattr(args, "nexar", False) and "nexar" not in sources:
+        sources.append("nexar")
 
     # Run audit
     result = audit_bom(analysis, project_dir=project_dir, temp_range=temp_range,
-                       sources=sources, delay=args.delay,
+                       sources=sources,
+                       delay=args.delay,
+                       cache_path=args.cache_path,
+                       ttl_days=args.ttl_days,
+                       use_cache=not getattr(args, "no_cache", False),
+                       table_path=args.table_path,
+                       concurrency=args.concurrency,
+                       confidence_exit=args.confidence_exit,
+                       report_threshold=args.report_threshold,
                        suggest_alternatives=args.suggest_alternatives)
 
     # Output
