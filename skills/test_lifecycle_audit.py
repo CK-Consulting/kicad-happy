@@ -100,6 +100,19 @@ def test_a_confirmed_miss_is_still_cached():
     assert c.covered("TPS62840DLCR", ["lcsc"], count=False) == {"lcsc": None}
 
 
+# -- alternatives ---------------------------------------------------------
+
+def test_alternatives_search_runs_without_credentials():
+    """LCSC needs no key, so this branch is reached on every machine. It used
+    to raise NameError on an undefined timeout and take the audit with it."""
+    lcsc = {"components": [{"stock": 120, "extra": {"mpn": "AP2112K-3.3TRG2",
+                                                    "manufacturer": "Diodes"}}]}
+    with _no_credentials(), _transport(lcsc):
+        alts = lifecycle_audit.find_alternatives("AP2112K-3.3TRG1", ["lcsc"],
+                                                 delay=0)
+    assert [a["mpn"] for a in alts] == ["AP2112K-3.3TRG2"]
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

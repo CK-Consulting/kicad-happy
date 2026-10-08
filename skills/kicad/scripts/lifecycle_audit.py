@@ -869,11 +869,13 @@ def audit_component(mpn: str, sources: list[str], project_dir: str | None = None
 
 def find_alternatives(mpn: str,
                       sources: list[str] | None = None,
-                      delay: float = 1.0) -> list[dict]:
+                      delay: float = 1.0,
+                      timeout: float = 10.0) -> list[dict]:
     """Search for active alternative parts when a component is EOL/NRND/obsolete.
 
     Checks Mouser's SuggestedReplacement field first, then searches DigiKey
-    and LCSC for parts with similar descriptions.
+    and LCSC for parts with similar descriptions. ``timeout`` is the deadline
+    for each request, matching the query functions' default.
 
     Returns list of alternatives with mpn, manufacturer, source, status.
     """
