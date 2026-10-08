@@ -112,6 +112,18 @@ def test_missing_credentials_are_not_cached_as_a_negative_answer():
     assert c.covered("TPS62840DLCR", ["digikey", "mouser"], count=False) == {}
 
 
+def test_missing_credentials_leave_no_timing_behind():
+    """A credential check returns in microseconds. Recording that as a
+    successful answer gave the source a near-zero latency, so once the key
+    was added it was allowed only the two-second floor."""
+    c = _cache()
+    with _no_credentials():
+        lifecycle_audit.audit_component("TPS62840DLCR", ["digikey", "mouser"],
+                                        cache=c)
+    for src in ("digikey", "mouser"):
+        assert c.timing(src) == {"ewma_s": None, "ok": 0, "timeouts": 0}, src
+
+
 def test_a_confirmed_miss_is_still_cached():
     """The source answered and does not carry the part. That one is worth
     remembering; re-asking is the expensive half of the audit."""

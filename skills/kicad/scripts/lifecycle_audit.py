@@ -776,7 +776,11 @@ def _timed_query(fn, mpn: str, timeout: float, source: str = "",
 
     A third outcome is neither: the source refusing us because we asked too
     fast. That must not be recorded as slowness, because the cure is waiting
-    longer between calls rather than waiting longer for an answer.
+    longer between calls rather than waiting longer for an answer. Nor is it
+    a latency, and neither is a missing key: both come back with ``ok=None``,
+    meaning "record no timing at all". A credential check that returns in
+    microseconds, recorded as a successful answer, gave a source a near-zero
+    latency and with it the two-second floor once the key was added.
 
     The fourth value says whether the source actually answered, which is what
     decides whether the result may be cached. Only an answer can be: a None
@@ -795,11 +799,11 @@ def _timed_query(fn, mpn: str, timeout: float, source: str = "",
         if (limiter is not None and source and cause is not None
                 and limiter.is_rejection(cause)):
             limiter.penalise(source)
-            return None, time.time() - started, True, False
+            return None, time.time() - started, None, False
         if isinstance(exc, SourceUnavailable):
             # A transport failure counts against the source's timing; a
-            # missing key does not, since nothing was waited for.
-            return None, time.time() - started, cause is None, False
+            # missing key is no observation at all, since nothing was asked.
+            return None, time.time() - started, (False if cause is not None else None), False
         if isinstance(exc, (urllib.error.URLError, OSError, json.JSONDecodeError,
                             KeyError, ValueError, TypeError)):
             return None, time.time() - started, False, False
@@ -875,7 +879,8 @@ def audit_component(mpn: str, sources: list[str], project_dir: str | None = None
                 except Exception:
                     data, elapsed, ok, answered = None, budgets[source_name], False, False
                 if cache is not None:
-                    cache.observe(source_name, elapsed, ok)
+                    if ok is not None:
+                        cache.observe(source_name, elapsed, ok)
                     if answered:
                         cache.put(mpn, source_name, data)
                 absorb(source_name, data)
