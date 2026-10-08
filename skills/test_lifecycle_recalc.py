@@ -11,13 +11,16 @@ Run directly (``python3 skills/test_lifecycle_recalc.py``) or under pytest.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "kicad" / "scripts"))
 
+import lifecycle_audit  # noqa: E402
 import lifecycle_recalc  # noqa: E402
 from lifecycle_cache import LifecycleCache  # noqa: E402
 from lifecycle_table import read_table, write_table  # noqa: E402
@@ -68,7 +71,67 @@ def test_a_mixed_case_mpn_finds_its_cached_answers():
     assert _recalc(proj) == 0
     row = read_table(os.path.join(proj, "lifecycle.md"))["nRF52840-QIAA"]
     assert row["Status"] == "active"
-    assert row["Sources"] == "1/2"
+    assert row["Sources"] == "1/1"
+
+
+# -- the same score the audit wrote ---------------------------------------
+
+@contextmanager
+def _distributors(**statuses):
+    """Every source answers; the ones named carry that lifecycle status."""
+    saved = dict(lifecycle_audit._API_FNS)
+
+    def answer(status):
+        return lambda mpn, timeout=10.0: ({"status": status} if status
+                                          else {"provides_status": False})
+    for src in saved:
+        lifecycle_audit._API_FNS[src] = answer(statuses.get(src))
+    try:
+        yield
+    finally:
+        lifecycle_audit._API_FNS.clear()
+        lifecycle_audit._API_FNS.update(saved)
+
+
+def _audit_then_recalc(*argv, **statuses):
+    """The audit's table row for one part, and the row recalc makes of it."""
+    proj = tempfile.mkdtemp()
+    analysis = os.path.join(proj, "schematic.json")
+    with open(analysis, "w") as fh:
+        json.dump({"file": os.path.join(proj, "board.kicad_sch"),
+                   "bom": [{"mpn": "TPS62840DLCR", "references": ["U1"]}]}, fh)
+    saved = sys.argv
+    sys.argv = ["lifecycle_audit.py", analysis,
+                "-o", os.path.join(proj, "lifecycle.json"), *argv]
+    try:
+        with _distributors(**statuses):
+            lifecycle_audit.main()
+    finally:
+        sys.argv = saved
+    table = os.path.join(proj, "lifecycle.md")
+    audited = dict(read_table(table)["TPS62840DLCR"])
+    assert _recalc(proj) == 0
+    return audited, read_table(table)["TPS62840DLCR"]
+
+
+def _scores(row):
+    return row["Computed"], row["Ack?"], row["Sources"]
+
+
+def test_recalc_reproduces_a_default_audit():
+    """A default audit asks DigiKey alone for status, so one active answer is
+    80 and settled. Recalc assumed Nexar too, and rewrote it as 57 and YES."""
+    audited, recalced = _audit_then_recalc(digikey="Active")
+    assert _scores(audited) == ("80", "", "1/1")
+    assert _scores(recalced) == _scores(audited)
+
+
+def test_recalc_reproduces_an_audit_that_asked_nexar():
+    """The source set the audit used is recorded with the cache, so a run
+    that opted into Nexar is rescored against two capable sources, not one."""
+    audited, recalced = _audit_then_recalc("--nexar", digikey="Active")
+    assert audited["Sources"] == "1/2"
+    assert _scores(recalced) == _scores(audited)
 
 
 if __name__ == "__main__":

@@ -142,6 +142,9 @@ class LifecycleCache:
         self.ttl = ttl_days * 86400.0
         self._entries: dict[str, dict] = {}
         self._timing: dict[str, dict] = {}
+        # The sources the last run asked, so a rescore from these answers can
+        # assume the same set the run was scored against.
+        self.sources: list[str] | None = None
         self.hits = 0
         self.misses = 0
         self.stale = 0
@@ -159,6 +162,7 @@ class LifecycleCache:
             return
         self._entries = blob.get("entries") or {}
         self._timing = blob.get("timing") or {}
+        self.sources = blob.get("sources") or None
 
     def save(self) -> None:
         blob = {
@@ -167,6 +171,8 @@ class LifecycleCache:
             "entries": self._entries,
             "timing": self._timing,
         }
+        if self.sources is not None:
+            blob["sources"] = list(self.sources)
         os.makedirs(os.path.dirname(os.path.abspath(self.path)) or ".", exist_ok=True)
         # Write beside the target and rename, so an interrupted run cannot
         # leave a half-written cache that the next one fails to parse.

@@ -728,6 +728,21 @@ DEFAULT_SOURCES = ["lcsc", "digikey", "element14", "mouser"]
 STATUS_CAPABLE = {"digikey", "nexar"}
 
 
+def run_sources(sources: list[str] | None = None) -> list[str]:
+    """The sources a run asks: the ones named, or the default set."""
+    return [s for s in _API_FNS
+            if (s in sources if sources else s in DEFAULT_SOURCES)]
+
+
+def status_capable_count(sources: list[str] | None = None) -> int:
+    """How many of a run's sources can return a lifecycle status at all.
+
+    The computed score's ceiling is set from this, so anything rescoring an
+    audit's answers has to count the same way or it cannot reproduce them.
+    """
+    return len([s for s in run_sources(sources) if s in STATUS_CAPABLE])
+
+
 def _timed_query(fn, mpn: str, timeout: float, source: str = "",
                  limiter=None):
     """Run one distributor query, reporting how long it took and whether it worked.
@@ -784,8 +799,7 @@ def audit_component(mpn: str, sources: list[str], project_dir: str | None = None
     per_source_status: dict[str, str] = {}
     temp_data = None
 
-    wanted = [s for s in _API_FNS
-              if (s in sources if sources else s in DEFAULT_SOURCES)]
+    wanted = run_sources(sources)
 
     # Try extraction cache first (no network, no delay)
     if project_dir:
@@ -1052,12 +1066,13 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
     # the sources the next part asks first.
     cache = None
     scheduler = None
-    run_sources = [s for s in _API_FNS
-                   if (s in sources if sources else s in DEFAULT_SOURCES)]
+    asked = run_sources(sources)
     if _LifecycleCache is not None and use_cache:
         path = cache_path or _default_cache_path(project_dir)
         cache = _LifecycleCache(path, ttl_days if ttl_days is not None else _DEFAULT_TTL_DAYS)
-        scheduler = _SourceScheduler(cache, run_sources)
+        # Recorded so lifecycle_recalc can rescore against the same set.
+        cache.sources = asked
+        scheduler = _SourceScheduler(cache, asked)
     limiter = _RateLimiter(cache) if _RateLimiter is not None else None
 
     ordered_mpns = sorted(mpn_map.items())
@@ -1074,7 +1089,7 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
     scoring = _table is not None and _compute is not None
     existing_rows = (_table.read_table(table_path_resolved)
                      if scoring and table_path_resolved else {})
-    api_capable = len([s for s in run_sources if s in STATUS_CAPABLE])
+    api_capable = status_capable_count(sources)
 
     def _score(mpn, data):
         """The 0-100 score for one part, or None when scoring is unavailable."""

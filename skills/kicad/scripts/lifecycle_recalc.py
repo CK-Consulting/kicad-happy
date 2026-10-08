@@ -25,7 +25,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lifecycle_audit import (  # noqa: E402
-    STATUS_CAPABLE, _default_cache_path, _default_table_path, _normalize_status,
+    _default_cache_path, _default_table_path, _normalize_status,
+    status_capable_count,
 )
 from lifecycle_cache import compute, mpn_key  # noqa: E402
 from lifecycle_table import (  # noqa: E402
@@ -33,6 +34,16 @@ from lifecycle_table import (  # noqa: E402
 )
 
 SEP = "\x1f"
+
+
+def recorded_sources(cache_path: str) -> list[str] | None:
+    """The source set the audit that wrote this cache asked, if it said."""
+    try:
+        with open(cache_path) as fh:
+            sources = json.load(fh).get("sources")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return list(sources) if isinstance(sources, list) and sources else None
 
 
 def statuses_from_cache(cache_path: str) -> dict[str, dict[str, str]]:
@@ -76,7 +87,8 @@ def main() -> int:
     ap.add_argument("--table", default=None)
     ap.add_argument("--sources", default=None,
                     help="Comma-separated source set the scores assume "
-                         "(default: every status-capable source)")
+                         "(default: the set the audit recorded in the cache, "
+                         "else the audit's default sources)")
     args = ap.parse_args()
 
     cache_path = args.cache or default_cache_path(args.project_dir)
@@ -101,8 +113,13 @@ def main() -> int:
         print("no table at %s" % table_path, file=sys.stderr)
         return 1
 
-    capable = (len([s for s in args.sources.split(",") if s.strip() in STATUS_CAPABLE])
-               if args.sources else len(STATUS_CAPABLE))
+    # Counted by the audit's own rule, against the sources the audit actually
+    # asked. Counting every status-capable source instead included Nexar,
+    # which a default audit never queries, so one active DigiKey answer the
+    # audit scored 80 came back from here as 57 and awaiting acknowledgement.
+    sources = ([s.strip() for s in args.sources.split(",") if s.strip()]
+               if args.sources else recorded_sources(cache_path))
+    capable = status_capable_count(sources)
 
     changed = 0
     for mpn, row in rows.items():
