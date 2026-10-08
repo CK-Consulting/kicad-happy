@@ -227,6 +227,43 @@ def test_a_human_check_still_counts_after_the_bom_respells_the_mpn():
     assert after["nRF52840-QIAA"]["Computed"] == "90"
 
 
+def _table_with_user(mpn, status, acknowledged=""):
+    from lifecycle_table import read_table, render_table, write_table
+    table = os.path.join(tempfile.mkdtemp(), "lifecycle.md")
+    write_table(table, {mpn: {"refs": ["U1"], "status": "unknown", "computed": 0.0,
+                              "raw": 0.0, "responding": 0, "capable": 1,
+                              "needs_ack": True}})
+    rows = read_table(table)
+    rows[mpn].update({"User Status": status, "Reference": "https://vendor.example/pcn",
+                      "Checked On": time.strftime("%Y-%m-%d"),
+                      "Acknowledged": acknowledged})
+    with open(table, "w", encoding="utf-8") as fh:
+        fh.write(render_table(list(rows.values())))
+    return table
+
+
+def test_the_emitted_finding_carries_the_status_the_table_shows():
+    """A referenced human "obsolete" against DigiKey's "active" made the table
+    read obsolete and awaiting acknowledgement, while the JSON finding that
+    reports consume still said LC-ACT, active."""
+    from lifecycle_table import read_table
+    table = _table_with_user("TPS62840DLCR", "obsolete")
+    bom = {"bom": [{"mpn": "TPS62840DLCR", "references": ["U1"]}]}
+    with _sources(digikey=_answers("Active")):
+        r = lifecycle_audit.audit_bom(bom, sources=["digikey"], use_cache=False,
+                                      table_path=table)
+    row = read_table(table)["TPS62840DLCR"]
+    f = [f for f in r["findings"] if f.get("category") == "lifecycle"
+         and f.get("mpn") == "TPS62840DLCR"][0]
+    assert row["Status"] == f["status"] == "obsolete"
+    assert f["rule_id"] == "LC-001"
+    assert f["consensus_split"] is True
+    assert f["per_source_status"] == {"digikey": "active", "user": "obsolete"}
+    assert r["lifecycle_summary"]["obsolete"] == 1
+    assert f["computed_confidence"] == float(row["Computed"])
+    assert f["needs_ack"] is (row["Ack?"] == "YES") is True
+
+
 def test_one_part_spelled_two_ways_in_the_bom_is_one_part():
     """Two BOM lines differing only in case were audited as two parts and
     written as two rows the table then reads back as one."""

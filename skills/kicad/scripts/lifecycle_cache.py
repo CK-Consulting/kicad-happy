@@ -545,6 +545,7 @@ def compute(per_source_status: dict[str, str], api_capable: int,
             "computed": 0.0, "ceiling": round(ceiling, 1), "raw": raw_conf,
             "status": "unknown", "capable": capable, "responding": 0,
             "user_counted": user_counts, "needs_ack": True, "blocks_fab": False,
+            "statuses": combined,
             "reasons": reasons + ["no source could supply a lifecycle status"],
         }
 
@@ -578,6 +579,9 @@ def compute(per_source_status: dict[str, str], api_capable: int,
         "capable": capable,
         "responding": responding,
         "user_counted": user_counts,
+        # Every opinion the score was built from, the human one as "user", so
+        # a consumer reporting the status can say what it rests on.
+        "statuses": combined,
         "needs_ack": needs_ack,
         # Lifecycle data that cannot be had is not a reason to stop a board.
         # It is a reason for someone to say, in writing, that they know.

@@ -1215,8 +1215,14 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
     for i, (mpn, refs) in enumerate(ordered_mpns):
         data = results[mpn]
 
-        # Lifecycle
-        status = data.get("status", "unknown")
+        # Lifecycle. The finding reports the same decision the table does:
+        # the computed status, with a referenced human check folded in. Using
+        # the API-only status here let a report say LC-ACT/active about a part
+        # the table had marked obsolete and awaiting acknowledgement.
+        scored = data.get("computed_confidence")
+        status = (scored or {}).get("status") or data.get("status", "unknown")
+        per_source = ((scored or {}).get("statuses")
+                      or data.get('per_source_status', {}))
         status_counts[status] = status_counts.get(status, 0) + 1
 
         finding = {
@@ -1225,6 +1231,13 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
             "status": status,
             "sources": data.get("sources", {}),
         }
+        if scored:
+            prior = existing_by_key.get(_mpn_key(mpn), {})
+            finding["computed_confidence"] = scored.get("computed")
+            # Outstanding, as the table's Ack? column means it: warranted and
+            # not yet signed for.
+            finding["needs_ack"] = bool(scored.get("needs_ack")
+                                        and not (prior.get("Acknowledged") or "").strip())
 
         # Flag non-active statuses
         if status in ("nrnd", "last_time_buy", "obsolete", "discontinued"):
@@ -1251,8 +1264,10 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
         rule_info = _LIFECYCLE_STATUS_RULES.get(status)
         if rule_info:
             rule_id, severity = rule_info
-            consensus_split = data.get('consensus_split', False)
-            per_source = data.get('per_source_status', {})
+            consensus_split = (any(s == 'active' for s in per_source.values())
+                               and any(s in ('obsolete', 'discontinued',
+                                             'last_time_buy', 'nrnd')
+                                       for s in per_source.values()))
             # Demote ERROR → WARNING when distributors disagree. The part is
             # still orderable from at least one active source, so "obsolete"
             # overstates the supply risk.
