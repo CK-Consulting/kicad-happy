@@ -1318,6 +1318,15 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
                 if weeks > max_lead_weeks:
                     max_lead_weeks = weeks
                     lead_source = src_name
+            # Nexar gives a day count under its own key rather than Mouser's
+            # week string, so it never reached the comparison above. Whole
+            # weeks, rounding down, as for a Mouser value quoted in days.
+            days = src_data.get('lead_time_days')
+            if isinstance(days, (int, float)) and days > 0:
+                weeks = int(days) // 7
+                if weeks > max_lead_weeks:
+                    max_lead_weeks = weeks
+                    lead_source = src_name
 
         if max_lead_weeks > 12:
             severity = 'warning' if max_lead_weeks > 26 else 'info'

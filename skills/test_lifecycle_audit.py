@@ -181,6 +181,23 @@ def test_a_cached_run_reports_the_range_a_fetched_one_does():
                                           "mouser": [-20.0, 105.0]}
 
 
+# -- lead time ------------------------------------------------------------
+
+def test_a_long_nexar_lead_time_raises_lc006():
+    """Nexar reports lead time in days, under its own key. LC-006 read only
+    Mouser's week count, so 200 days from Nexar produced no finding."""
+    bom = {"bom": [{"mpn": "TPS62840DLCR", "references": ["U1"]}]}
+    with _sources(nexar=_ranged({"status": "Production", "lead_time_days": 200})):
+        r = lifecycle_audit.audit_bom(
+            bom, sources=["nexar"], use_cache=False,
+            table_path=os.path.join(tempfile.mkdtemp(), "lifecycle.md"))
+    lc006 = [f for f in r["findings"] if f.get("rule_id") == "LC-006"]
+    assert len(lc006) == 1
+    assert lc006[0]["lead_weeks"] == 28
+    assert lc006[0]["lead_source"] == "nexar"
+    assert lc006[0]["severity"] == "warning"
+
+
 # -- --no-cache -----------------------------------------------------------
 
 def _run_cli(*argv):
