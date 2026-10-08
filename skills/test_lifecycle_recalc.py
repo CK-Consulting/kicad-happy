@@ -120,9 +120,8 @@ def _distributors(**statuses):
         lifecycle_audit._API_FNS.update(saved)
 
 
-def _audit_then_recalc(*argv, **statuses):
-    """The audit's table row for one part, and the row recalc makes of it."""
-    proj = tempfile.mkdtemp()
+def _audit(proj, *argv, **statuses):
+    """Run the audit CLI on a one-part BOM in proj; return its table row."""
     analysis = os.path.join(proj, "schematic.json")
     with open(analysis, "w") as fh:
         json.dump({"file": os.path.join(proj, "board.kicad_sch"),
@@ -135,10 +134,15 @@ def _audit_then_recalc(*argv, **statuses):
             lifecycle_audit.main()
     finally:
         sys.argv = saved
-    table = os.path.join(proj, "lifecycle.md")
-    audited = dict(read_table(table)["TPS62840DLCR"])
+    return dict(read_table(os.path.join(proj, "lifecycle.md"))["TPS62840DLCR"])
+
+
+def _audit_then_recalc(*argv, **statuses):
+    """The audit's table row for one part, and the row recalc makes of it."""
+    proj = tempfile.mkdtemp()
+    audited = _audit(proj, *argv, **statuses)
     assert _recalc(proj) == 0
-    return audited, read_table(table)["TPS62840DLCR"]
+    return audited, read_table(os.path.join(proj, "lifecycle.md"))["TPS62840DLCR"]
 
 
 def _scores(row):
@@ -160,6 +164,20 @@ def test_recalc_reproduces_an_audit_that_asked_nexar():
     assert audited["Sources"] == "1/2"
     assert _scores(recalced) == _scores(audited)
 
+
+
+def test_a_stale_answer_from_a_source_the_audit_dropped_is_not_scored():
+    """A Nexar run leaves its answer in the shared cache; the default audit
+    after it ignores Nexar. Recalc fed every cached status to the score, so
+    the old Nexar "obsolete" overrode DigiKey's current "active"."""
+    proj = tempfile.mkdtemp()
+    _audit(proj, "--nexar", digikey="Active", nexar="Obsolete")
+    audited = _audit(proj, digikey="Active")
+    assert audited["Status"] == "active"
+    assert _recalc(proj) == 0
+    recalced = read_table(os.path.join(proj, "lifecycle.md"))["TPS62840DLCR"]
+    assert recalced["Status"] == "active"
+    assert _scores(recalced) == _scores(audited)
 
 if __name__ == "__main__":
     failures = 0

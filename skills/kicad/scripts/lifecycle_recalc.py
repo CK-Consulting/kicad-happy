@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lifecycle_audit import (  # noqa: E402
     _default_cache_path, _default_table_path, _normalize_status,
-    status_capable_count,
+    run_sources, status_capable_count,
 )
 from lifecycle_cache import compute, mpn_key  # noqa: E402
 from lifecycle_table import (  # noqa: E402
@@ -124,11 +124,17 @@ def main() -> int:
     sources = ([s.strip() for s in args.sources.split(",") if s.strip()]
                if args.sources else recorded_sources(cache_path))
     capable = status_capable_count(sources)
+    # Only those sources' answers count, too. The cache is shared across runs,
+    # so a Nexar answer from an opt-in run outlives it; the default audit after
+    # that never reads it, and scoring it here let a stale "obsolete" override
+    # DigiKey's current "active". The audit reads only the sources it asks.
+    asked = set(run_sources(sources))
 
     changed = 0
     for mpn, row in rows.items():
         # Cache keys are normalised; the table keeps the part's own spelling.
-        per_source = cached.get(mpn_key(mpn), {})
+        per_source = {src: st for src, st in cached.get(mpn_key(mpn), {}).items()
+                      if src in asked}
         scored = compute(per_source, capable, user_row(row))
         before = (row.get("Computed"), row.get("Ack?"))
         row["Status"] = scored.get("status", "unknown")
