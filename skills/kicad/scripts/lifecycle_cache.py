@@ -271,8 +271,13 @@ class LifecycleCache:
             # Recent behaviour matters more than history: a distributor that
             # slowed down this week should be reranked this week.
             row["ewma_s"] = seconds if prev is None else 0.7 * prev + 0.3 * seconds
+            row["streak"] = 0
         else:
             row["timeouts"] += 1
+            # Timeouts since the last answer. A timed-out call has no latency
+            # to fold into the mean, so without this a source that slowed
+            # down after one fast answer was held to that answer's budget.
+            row["streak"] = row.get("streak", 0) + 1
 
     def timing(self, source: str) -> dict:
         return dict(self._timing.get(source) or {"ewma_s": None, "ok": 0, "timeouts": 0})
@@ -312,12 +317,13 @@ class SourceScheduler:
             # that genuinely needs longer will climb on its own.
             return LADDER[0] if timeouts == 0 else LADDER[min(timeouts, len(LADDER) - 1)]
         # Two and a half times the running mean, rounded up the ladder, so a
-        # source sits one comfortable step above its own typical answer.
+        # source sits one comfortable step above its own typical answer -
+        # then one rung further per timeout since it last answered, so a
+        # source that has slowed down earns the time back, up to the top.
         want = ewma * 2.5
-        for rung in LADDER:
-            if want <= rung:
-                return rung
-        return LADDER[-1]
+        step = next((i for i, rung in enumerate(LADDER) if want <= rung),
+                    len(LADDER) - 1)
+        return LADDER[min(step + t.get("streak", 0), len(LADDER) - 1)]
 
     def order(self) -> list[str]:
         """Sources fastest-first; unproven ones ahead of known-slow ones."""

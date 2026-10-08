@@ -230,6 +230,31 @@ def test_timeouts_climb_the_ladder():
     assert SourceScheduler(c, SOURCES).budget("mouser") > LADDER[0]
 
 
+def test_timeouts_widen_a_budget_even_after_a_fast_answer():
+    """The running mean alone set the budget once one existed, so a source
+    that answered fast once and then slowed down was held to the floor and
+    timed out on every part from then on."""
+    c = _cache()
+    c.observe("digikey", 0.2, True)
+    s = SourceScheduler(c, SOURCES)
+    floor = s.budget("digikey")
+    assert floor == LADDER[0]
+    c.observe("digikey", floor, False)
+    assert s.budget("digikey") > floor
+    for _ in range(20):
+        c.observe("digikey", s.budget("digikey"), False)
+    assert s.budget("digikey") == LADDER[-1]        # bounded by the ladder
+
+
+def test_an_answer_ends_the_timeout_streak():
+    c = _cache()
+    c.observe("digikey", 0.2, True)
+    for _ in range(3):
+        c.observe("digikey", 2.0, False)
+    c.observe("digikey", 0.2, True)
+    assert SourceScheduler(c, SOURCES).budget("digikey") == LADDER[0]
+
+
 def test_ranking_puts_the_fast_source_first():
     c = _cache()
     c.observe("lcsc", 0.4, True)
