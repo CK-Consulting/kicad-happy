@@ -470,6 +470,30 @@ def test_alternatives_search_runs_without_credentials():
     assert [a["mpn"] for a in alts] == ["AP2112K-3.3TRG2"]
 
 
+
+def test_alternatives_read_the_current_flat_lcsc_response():
+    """jlcsearch now returns fields flat ("mfr" is the part number). The
+    alternatives search read only extra.mpn, so against the live API every
+    component's MPN was empty and LCSC never offered an alternative."""
+    lcsc = {"components": [{"mfr": "AP2112K-3.3TRG2", "lcsc": "C51118",
+                            "package": "SOT-23-5", "stock": 120}]}
+    with _no_credentials(), _transport(lcsc):
+        alts = lifecycle_audit.find_alternatives("AP2112K-3.3TRG1", ["lcsc"], delay=0)
+    assert [a["mpn"] for a in alts] == ["AP2112K-3.3TRG2"]
+    assert alts[0]["lcsc_stock"] == 120
+
+
+
+def test_a_nested_manufacturer_object_yields_its_name():
+    """The nested response carries the manufacturer as {"id", "name"}; it was
+    being stringified whole into a Python repr."""
+    lcsc = {"components": [{"stock": 5, "extra": {
+        "mpn": "GRM188R71C104KA01D", "manufacturer": {"id": 4, "name": "Murata Electronics"}}}]}
+    with _no_credentials(), _transport(lcsc):
+        alts = lifecycle_audit.find_alternatives("GRM188R71C104KA01J", ["lcsc"], delay=0)
+    assert alts[0]["manufacturer"] == "Murata Electronics"
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
