@@ -144,6 +144,20 @@ class _SpatialGrid:
                         best_key = key
         return best_key
 
+    def within(self, x: float, y: float, tolerance: float) -> list[str]:
+        """Every key within tolerance, nearest first."""
+        cx, cy = int(x / self._cell), int(y / self._cell)
+        r = max(1, int(math.ceil(tolerance / self._cell)))
+        t2 = tolerance * tolerance
+        hits: list[tuple[float, str]] = []
+        for dx in range(-r, r + 1):
+            for dy in range(-r, r + 1):
+                for key, kx, ky in self._grid.get((cx + dx, cy + dy), []):
+                    d2 = (kx - x) ** 2 + (ky - y) ** 2
+                    if d2 <= t2:
+                        hits.append((d2, key))
+        return [k for _, k in sorted(hits)]
+
 
 def build_connectivity_graph(
     footprints: list[dict],
@@ -353,6 +367,21 @@ def build_connectivity_graph(
         for seg in net_track_segments.get(net_name, []):
             uf.union(seg['a'], seg['b'])
 
+        # Phase 1b: T-junctions. A router may end a track on the body of
+        # another rather than at its endpoint; KiCad connects them, and
+        # endpoint buckets alone left the two as separate islands.
+        net_segs = net_track_segments.get(net_name, [])
+        for node in nodes:
+            if node.get('kind') != 'track':
+                continue
+            half = node.get('copper_radius', 0.0)
+            for seg in net_segs:
+                if seg['layer'] != node['layer'] or node['key'] in (seg['a'], seg['b']):
+                    continue
+                if _dist_point_to_segment(node['x'], node['y'], seg['x1'], seg['y1'],
+                                          seg['x2'], seg['y2']) <= half + seg.get('width', 0.0) / 2.0:
+                    uf.union(node['key'], seg['a'])
+
         # Phase 2: Attach pads and vias to routed copper nearby.
         # Use the spatial grid to find candidate track endpoints instead of
         # iterating all segments — keeps this O(pads × nearby) not O(pads × all).
@@ -370,8 +399,13 @@ def build_connectivity_graph(
             if not grid:
                 continue
             tolerance = max(0.5, node.get('copper_radius', 0.0) + 0.25)
-            nearby = grid.nearest(node['x'], node['y'], tolerance)
-            if nearby and nearby != node['key']:
+            # Every track ending on this pad or via, not only the nearest: a
+            # power pad with three tracks arriving at different points on its
+            # copper attached one and left the other two as islands, which
+            # PS-002 then reported as a split plane on a fully routed board.
+            for nearby in grid.within(node['x'], node['y'], tolerance):
+                if nearby == node['key']:
+                    continue
                 # Verify via distance-to-segment if we have the segment data
                 seg = seg_by_endpoint.get(nearby)
                 if seg and seg['layer'] == node['layer']:
