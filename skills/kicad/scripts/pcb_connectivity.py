@@ -404,11 +404,21 @@ def build_connectivity_graph(
         CELL = 1.0
         for seg in net_segs:
             pad = seg.get('width', 0.0) / 2.0 + 0.5  # and the endpoint's own half-width
-            for cx in range(int(math.floor((min(seg['x1'], seg['x2']) - pad) / CELL)),
-                            int(math.floor((max(seg['x1'], seg['x2']) + pad) / CELL)) + 1):
-                for cy in range(int(math.floor((min(seg['y1'], seg['y2']) - pad) / CELL)),
-                                int(math.floor((max(seg['y1'], seg['y2']) + pad) / CELL)) + 1):
-                    seg_cells.setdefault((seg['layer'], cx, cy), []).append(seg)
+            # The cells along the segment, not its whole box: a long diagonal
+            # track's box is mostly far from its copper.
+            reach = int(math.ceil(pad / CELL))
+            length = math.hypot(seg['x2'] - seg['x1'], seg['y2'] - seg['y1'])
+            steps = max(1, int(math.ceil(length / (CELL / 2.0))))
+            cells: set[tuple[int, int]] = set()
+            for k in range(steps + 1):
+                t = k / steps
+                cx = int(math.floor((seg['x1'] + t * (seg['x2'] - seg['x1'])) / CELL))
+                cy = int(math.floor((seg['y1'] + t * (seg['y2'] - seg['y1'])) / CELL))
+                for dx in range(-reach, reach + 1):
+                    for dy in range(-reach, reach + 1):
+                        cells.add((cx + dx, cy + dy))
+            for cx, cy in cells:
+                seg_cells.setdefault((seg['layer'], cx, cy), []).append(seg)
         for node in nodes:
             if node.get('kind') != 'track':
                 continue
