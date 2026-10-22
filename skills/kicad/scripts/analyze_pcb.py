@@ -1808,15 +1808,25 @@ def analyze_return_path_continuity(tracks, net_names, zones, zone_fills,
             if length < 0.1:
                 continue
 
-            # Sample along the trace
+            # Sample along the trace. Points inside one of the net's own via
+            # holes are where it changes layer and are dropped; a short trace
+            # between two vias then had no samples at all and was exempt,
+            # gap or not, so one is taken from the stretch between the holes.
             n_samples = max(2, int(length / SAMPLE_INTERVAL) + 1)
-            for k in range(n_samples):
-                t = k / max(n_samples - 1, 1)
+            here = own_vias.get(net_id, ())
+
+            def in_hole(px, py):
+                return any(math.hypot(px - vx, py - vy) <= r for vx, vy, r in here)
+
+            ts = [k / max(n_samples - 1, 1) for k in range(n_samples)]
+            kept = [t for t in ts if not in_hole(x1 + t * dx, y1 + t * dy)]
+            if not kept and here:
+                fine = [k / 40 for k in range(41)]
+                clear = [t for t in fine if not in_hole(x1 + t * dx, y1 + t * dy)]
+                kept = [clear[len(clear) // 2]] if clear else []
+            for t in kept:
                 px = x1 + t * dx
                 py = y1 + t * dy
-                if any(math.hypot(px - vx, py - vy) <= r
-                       for vx, vy, r in own_vias.get(net_id, ())):
-                    continue
                 total_samples += 1
 
                 # Check for ANY copper (zone, track, pad) on opposite layer
