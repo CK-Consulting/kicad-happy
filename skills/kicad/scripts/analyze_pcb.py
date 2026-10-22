@@ -1743,8 +1743,9 @@ def analyze_return_path_continuity(tracks, net_names, zones, zone_fills,
         debug_samples: If a list is passed, per-sample dicts are appended
             with keys {net, x, y, layer, hit} for GP-001 diagnostics.
         vias: Via dict with 'vias'. A sample within one of its own net's
-            vias' clearance holes is where the trace changes layer, not a gap
-            under it, and is not counted. On a 4-layer board every signal via
+            vias' clearance holes, where that via passes through the reference
+            layer, is where the trace changes layer, not a gap under it, and
+            is not counted. On a 4-layer board every signal via
             punches through both inner planes, and every trace samples its own
             endpoints: 84 of 89 "gaps" on one board were exactly that.
 
@@ -1780,14 +1781,27 @@ def analyze_return_path_continuity(tracks, net_names, zones, zone_fills,
     # A via's hole in a plane: its pad plus a clearance. KiCad's default
     # clearance is 0.2 mm; 0.3 covers the usual net-class values.
     VIA_HOLE_MARGIN = 0.3
-    own_vias: dict[int, list[tuple[float, float, float]]] = {}
+    def _order(layer):
+        if layer == 'F.Cu':
+            return 0
+        if layer == 'B.Cu':
+            return 10_000
+        digits = ''.join(ch for ch in layer if ch.isdigit())
+        return int(digits) if digits else 5_000
+
+    # (x, y, hole radius, lowest and highest stack position the via spans):
+    # a blind or buried via makes no hole in a plane it does not reach.
+    own_vias: dict[int, list[tuple[float, float, float, int, int]]] = {}
     for via in (vias or {}).get('vias', []) or []:
         vnet = via.get('net', 0)
         if not isinstance(vnet, int) or vnet <= 0:
             continue
         size = via.get('size') or via.get('diameter') or 0.0
+        ends = [l for l in (via.get('layers') or []) if '.Cu' in l and l != '*.Cu']
+        span = ((min(map(_order, ends)), max(map(_order, ends))) if len(ends) >= 2
+                else (0, 10_000))
         own_vias.setdefault(vnet, []).append(
-            (via.get('x', 0.0), via.get('y', 0.0), size / 2.0 + VIA_HOLE_MARGIN))
+            (via.get('x', 0.0), via.get('y', 0.0), size / 2.0 + VIA_HOLE_MARGIN) + span)
 
     for net_id, segs in net_segments.items():
         net_name = net_names.get(net_id, f"net_{net_id}")
@@ -1815,8 +1829,11 @@ def analyze_return_path_continuity(tracks, net_names, zones, zone_fills,
             n_samples = max(2, int(length / SAMPLE_INTERVAL) + 1)
             here = own_vias.get(net_id, ())
 
+            ref = _order(opp_layer)
+
             def in_hole(px, py):
-                return any(math.hypot(px - vx, py - vy) <= r for vx, vy, r in here)
+                return any(lo <= ref <= hi and math.hypot(px - vx, py - vy) <= r
+                           for vx, vy, r, lo, hi in here)
 
             ts = [k / max(n_samples - 1, 1) for k in range(n_samples)]
             kept = [t for t in ts if not in_hole(x1 + t * dx, y1 + t * dy)]
