@@ -82,6 +82,33 @@ def _expand_copper_layers(layers: list[str],
     return list(dict.fromkeys(expanded))
 
 
+def _stack_order(layer: str) -> int:
+    """F.Cu first, In1.Cu .. InN.Cu, B.Cu last."""
+    if layer == 'F.Cu':
+        return 0
+    if layer == 'B.Cu':
+        return 10_000
+    digits = ''.join(ch for ch in layer if ch.isdigit())
+    return int(digits) if digits else 5_000
+
+
+def _via_copper_layers(layers: list[str], copper_layers: list[str]) -> list[str]:
+    """Every copper layer a via is copper on: all of them between its pair.
+
+    KiCad writes a through via as ``(layers "F.Cu" "B.Cu")``, its two ends,
+    and it is copper on every inner layer between. Taken as written, a via
+    reached no inner plane, so a ground stitching via that connects only to
+    the inner GND planes counted as an island of its own: 35 GND "islands" on
+    a board KiCad reports fully connected. Blind and buried vias span their
+    pair the same way.
+    """
+    ends = _expand_copper_layers(layers, copper_layers)
+    if len(ends) < 2:
+        return ends
+    lo, hi = min(_stack_order(l) for l in ends), max(_stack_order(l) for l in ends)
+    return [l for l in copper_layers if lo <= _stack_order(l) <= hi]
+
+
 class UnionFind:
     """Weighted union-find with path compression."""
 
@@ -143,6 +170,20 @@ class _SpatialGrid:
                         best_dist = d2
                         best_key = key
         return best_key
+
+    def within(self, x: float, y: float, tolerance: float) -> list[str]:
+        """Every key within tolerance, nearest first."""
+        cx, cy = int(x / self._cell), int(y / self._cell)
+        r = max(1, int(math.ceil(tolerance / self._cell)))
+        t2 = tolerance * tolerance
+        hits: list[tuple[float, str]] = []
+        for dx in range(-r, r + 1):
+            for dy in range(-r, r + 1):
+                for key, kx, ky in self._grid.get((cx + dx, cy + dy), []):
+                    d2 = (kx - x) ** 2 + (ky - y) ** 2
+                    if d2 <= t2:
+                        hits.append((d2, key))
+        return [k for _, k in sorted(hits)]
 
 
 def build_connectivity_graph(
@@ -227,7 +268,7 @@ def build_connectivity_graph(
         if x is None or y is None:
             continue
         via_key = f"via_{i}"
-        layers = _expand_copper_layers(via.get('layers', []), copper_layers)
+        layers = _via_copper_layers(via.get('layers', []), copper_layers)
         size = via.get('size', 0) or 0
         copper_radius = size / 2.0 if size else 0.0
         for layer in layers:
@@ -353,6 +394,43 @@ def build_connectivity_graph(
         for seg in net_track_segments.get(net_name, []):
             uf.union(seg['a'], seg['b'])
 
+        # Phase 1b: T-junctions. A router may end a track on the body of
+        # another rather than at its endpoint; KiCad connects them, and
+        # endpoint buckets alone left the two as separate islands. Segments
+        # are indexed by the grid cells their box covers, so each endpoint
+        # tests only the segments near it, not the whole net.
+        net_segs = net_track_segments.get(net_name, [])
+        seg_cells: dict[tuple[str, int, int], list[dict]] = {}
+        CELL = 1.0
+        for seg in net_segs:
+            pad = seg.get('width', 0.0) / 2.0 + 0.5  # and the endpoint's own half-width
+            # The cells along the segment, not its whole box: a long diagonal
+            # track's box is mostly far from its copper.
+            reach = int(math.ceil(pad / CELL))
+            length = math.hypot(seg['x2'] - seg['x1'], seg['y2'] - seg['y1'])
+            steps = max(1, int(math.ceil(length / (CELL / 2.0))))
+            cells: set[tuple[int, int]] = set()
+            for k in range(steps + 1):
+                t = k / steps
+                cx = int(math.floor((seg['x1'] + t * (seg['x2'] - seg['x1'])) / CELL))
+                cy = int(math.floor((seg['y1'] + t * (seg['y2'] - seg['y1'])) / CELL))
+                for dx in range(-reach, reach + 1):
+                    for dy in range(-reach, reach + 1):
+                        cells.add((cx + dx, cy + dy))
+            for cx, cy in cells:
+                seg_cells.setdefault((seg['layer'], cx, cy), []).append(seg)
+        for node in nodes:
+            if node.get('kind') != 'track':
+                continue
+            half = node.get('copper_radius', 0.0)
+            cell = (node['layer'], int(math.floor(node['x'] / CELL)), int(math.floor(node['y'] / CELL)))
+            for seg in seg_cells.get(cell, ()):
+                if node['key'] in (seg['a'], seg['b']):
+                    continue
+                if _dist_point_to_segment(node['x'], node['y'], seg['x1'], seg['y1'],
+                                          seg['x2'], seg['y2']) <= half + seg.get('width', 0.0) / 2.0:
+                    uf.union(node['key'], seg['a'])
+
         # Phase 2: Attach pads and vias to routed copper nearby.
         # Use the spatial grid to find candidate track endpoints instead of
         # iterating all segments — keeps this O(pads × nearby) not O(pads × all).
@@ -370,19 +448,29 @@ def build_connectivity_graph(
             if not grid:
                 continue
             tolerance = max(0.5, node.get('copper_radius', 0.0) + 0.25)
-            nearby = grid.nearest(node['x'], node['y'], tolerance)
-            if nearby and nearby != node['key']:
+            # Every track ending on this pad or via, not only the nearest: a
+            # power pad with three tracks arriving at different points on its
+            # copper attached one and left the other two as islands, which
+            # PS-002 then reported as a split plane on a fully routed board.
+            candidates = [k for k in grid.within(node['x'], node['y'], tolerance)
+                          if k != node['key']]
+            for rank, nearby in enumerate(candidates):
+                # The nearest keeps the existing 0.12 mm allowance. Any further
+                # endpoint must actually touch the copper: the allowance alone
+                # merged a track ending 0.1 mm short of the pad and hid a real
+                # routing gap.
+                slack = 0.12 if rank == 0 else 0.0
                 # Verify via distance-to-segment if we have the segment data
                 seg = seg_by_endpoint.get(nearby)
                 if seg and seg['layer'] == node['layer']:
                     clearance = (node.get('copper_radius', 0.0)
-                                 + (seg.get('width', 0.0) / 2.0) + 0.12)
+                                 + (seg.get('width', 0.0) / 2.0) + slack)
                     if _dist_point_to_segment(
                             node['x'], node['y'],
                             seg['x1'], seg['y1'],
                             seg['x2'], seg['y2']) <= clearance:
                         uf.union(node['key'], nearby)
-                else:
+                elif rank == 0:
                     uf.union(node['key'], nearby)
 
         # Phase 3: Zone fills — only probe pads and vias (track endpoints
