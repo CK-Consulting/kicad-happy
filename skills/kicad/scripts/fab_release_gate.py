@@ -164,15 +164,24 @@ def check_documentation(pcb: Dict) -> List[Dict]:
     return checks
 
 
+def _physical(pin) -> bool:
+    """A pin that will be a pad: not a #PWR or #FLG symbol's, which the net map
+    keeps (the rail audits look for them there) and no board ever carries."""
+    ref = pin.get("component") if isinstance(pin, dict) else None
+    return not (isinstance(ref, str) and ref.startswith("#"))
+
+
 def _schematic_multi_pin_nets(sch: Dict) -> Optional[int]:
-    """Nets in the schematic analysis with two or more pins, or None if it lists none."""
+    """Nets in the schematic analysis joining two or more physical pins, or None
+    if it lists none. A connector pin tied to a VCC symbol is two pins in the
+    net map and one pad on the board."""
     nets = sch.get("nets")
     if not isinstance(nets, dict) or not nets:
         return None
     counted = [n for n in nets.values() if isinstance(n, dict) and isinstance(n.get("pins"), list)]
     if not counted:
         return None
-    return sum(1 for n in counted if len(n["pins"]) >= 2)
+    return sum(1 for n in counted if sum(1 for p in n["pins"] if _physical(p)) >= 2)
 
 
 def _pcb_multi_pad_nets(pcb: Dict) -> Optional[int]:
