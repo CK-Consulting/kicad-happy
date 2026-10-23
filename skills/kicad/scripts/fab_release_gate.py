@@ -164,6 +164,41 @@ def check_documentation(pcb: Dict) -> List[Dict]:
     return checks
 
 
+def _schematic_multi_pin_nets(sch: Dict) -> Optional[int]:
+    """Nets in the schematic analysis with two or more pins, or None if it lists none."""
+    nets = sch.get("nets")
+    if not isinstance(nets, dict) or not nets:
+        return None
+    counted = [n for n in nets.values() if isinstance(n, dict) and isinstance(n.get("pins"), list)]
+    if not counted:
+        return None
+    return sum(1 for n in counted if len(n["pins"]) >= 2)
+
+
+def _pcb_multi_pad_nets(pcb: Dict) -> Optional[int]:
+    """Nets on the board with two or more pads, from its footprints' pads, or None."""
+    footprints = pcb.get("footprints")
+    if not isinstance(footprints, list) or not footprints:
+        return None
+    pads: Dict[str, int] = {}
+    seen = False
+    for fp in footprints:
+        if not isinstance(fp, dict):
+            continue
+        # The full analysis lists pads; the compact one maps pad to net.
+        if isinstance(fp.get("pad_nets"), dict):
+            names = [(v.get("net") if isinstance(v, dict) else v) for v in fp["pad_nets"].values()]
+        else:
+            names = [pad.get("net_name") for pad in (fp.get("pads") or []) if isinstance(pad, dict)]
+        for name in names:
+            seen = True
+            if name:
+                pads[name] = pads.get(name, 0) + 1
+    if not seen:
+        return None
+    return sum(1 for count in pads.values() if count >= 2)
+
+
 def check_consistency(sch: Dict, pcb: Dict) -> List[Dict]:
     """Check schematic ↔ PCB consistency."""
     checks = []
@@ -203,10 +238,20 @@ def check_consistency(sch: Dict, pcb: Dict) -> List[Dict]:
                               {"schematic_placeable": sch_placeable,
                                "pcb_footprints": pcb_fp, "difference": comp_diff}))
 
-    # Net count comparison
-    sch_nets = sch_stats.get("total_nets", 0)
-    pcb_nets = pcb_stats.get("net_count",
-                              pcb.get("connectivity", {}).get("total_nets_with_pads", 0))
+    # Net count comparison. Nets joining two or more pins, on both sides, when
+    # the analyses say which: a pin left unconnected is a one-pin net in the
+    # schematic, and on the board it is a one-pad net only if the tool that
+    # wrote the board gave it one. KiCad does; a generator that leaves such pads
+    # with no net does not, and comparing totals then reported a board that
+    # matches its schematic exactly as 36 nets short (76 vs 40).
+    sch_multi = _schematic_multi_pin_nets(sch)
+    pcb_multi = _pcb_multi_pad_nets(pcb)
+    if sch_multi is not None and pcb_multi is not None:
+        sch_nets, pcb_nets = sch_multi, pcb_multi
+    else:
+        sch_nets = sch_stats.get("total_nets", 0)
+        pcb_nets = pcb_stats.get("net_count",
+                                  pcb.get("connectivity", {}).get("total_nets_with_pads", 0))
 
     net_diff = abs(sch_nets - pcb_nets)
     if net_diff == 0:
